@@ -1,0 +1,121 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Plywood Cut Layout</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<header>
+  <h1>Plywood Cut Layout</h1>
+  <div id="source" class="source">no file loaded</div>
+  <div class="spacer"></div>
+  <div id="status" class="status"></div>
+</header>
+
+<div id="app">
+  <aside id="sidebar">
+    <div class="scroll">
+      <section class="panel">
+        <h2>File</h2>
+        <button id="pick" class="primary">Choose STEP file…</button>
+        <button id="sample" class="ghost" hidden>Load sample</button>
+        <input type="file" id="file" accept=".step,.stp,.STEP,.STP" hidden>
+      </section>
+
+      <section class="panel">
+        <h2>Sheet &amp; blade</h2>
+        <label>Sheet width <span><input type="number" id="sheetW" value="48" step="0.25"> in</span></label>
+        <label>Sheet length <span><input type="number" id="sheetL" value="96" step="0.25"> in</span></label>
+        <label>Kerf (blade) <span><input type="number" id="kerf" value="0.087" step="0.001"> in</span></label>
+        <label>Edge trim <span><input type="number" id="trim" value="0" step="0.0625"> in</span></label>
+        <label>Goal <span><select id="mode">
+            <option value="material" selected>Least plywood</option>
+            <option value="cuts">Fewest cuts</option>
+            <option value="cabinets">Group cabinets</option>
+          </select></span></label>
+        <label>Effort <span><select id="effort">
+            <option value="fast">Fast (2s)</option>
+            <option value="normal">Normal (15s)</option>
+            <option value="thorough" selected>Thorough (2 min)</option>
+          </select></span></label>
+        <label>Units <span><select id="units">
+            <option value="in" selected>inches</option><option value="mm">mm</option>
+          </select></span></label>
+        <label class="check"><input type="checkbox" id="showCuts" checked> Show cut lines</label>
+        <label class="check"><input type="checkbox" id="showOutlines" checked> Show part outlines</label>
+        <label class="check"><input type="checkbox" id="animate" checked> Animate the search</label>
+        <label class="check"><input type="checkbox" id="keepGoing" checked> Keep improving in the background</label>
+        <button id="solve" class="primary" disabled>Run optimiser</button>
+        <div id="stats" class="stats"></div>
+      </section>
+
+      <section class="panel grow">
+        <h2>Parts <span id="partCount" class="muted"></span></h2>
+        <p class="muted small">Uncheck anything that isn't plywood. Lock grain to stop a part
+          rotating. Click a name to rename it.</p>
+        <div id="parts" class="parts"></div>
+      </section>
+    </div>
+  </aside>
+
+  <div id="vsplit" class="splitter vertical" title="Drag to resize"></div>
+
+  <div id="main">
+    <div id="viewer">
+      <div id="viewerBar" class="viewerbar" hidden>
+        <button id="zoomOut" title="Zoom out">−</button>
+        <span id="zoomLabel">100%</span>
+        <button id="zoomIn" title="Zoom in">+</button>
+        <button id="fit" class="wide">Fit</button>
+        <span class="hint">scroll to zoom · drag to pan</span>
+      </div>
+      <div id="empty" class="empty">
+        <div class="emptyinner">
+          <strong>No file loaded</strong>
+          <p>Choose a STEP assembly to lay out, or drop one anywhere on this panel.</p>
+          <button id="pick2" class="primary">Choose STEP file…</button>
+        </div>
+      </div>
+      <svg id="canvas" hidden></svg>
+
+      <div id="loading" class="loading" hidden>
+        <div class="loadcard">
+          <div class="loadhead"><span class="spinner"></span><span id="loadTitle">Working…</span></div>
+          <div class="bar"><div id="loadBar"></div></div>
+          <div id="loadDetail" class="loaddetail"></div>
+        </div>
+      </div>
+
+      <div id="warnings" class="warnings"></div>
+    </div>
+
+    <div id="hsplit" class="splitter horizontal" title="Drag to resize"></div>
+
+    <div id="bottom">
+      <section class="pane">
+        <div class="panehead">
+          <h2>Cut order <span id="cutCount" class="muted"></span></h2>
+        </div>
+        <div id="cutlist" class="scroll"></div>
+      </section>
+      <div id="bsplit" class="splitter vertical thin" title="Drag to resize"></div>
+      <section class="pane">
+        <div class="panehead">
+          <h2>Materials</h2>
+          <div class="seg" role="group" aria-label="Bill of materials view">
+            <button id="bomPieces" class="on" type="button">Pieces</button>
+            <button id="bomSheets" type="button">Plywood</button>
+          </div>
+        </div>
+        <div id="bom" class="scroll"></div>
+      </section>
+    </div>
+  </div>
+</div>
+
+<div id="dropmask" class="dropmask" hidden><span>Drop STEP file to load</span></div>
+<script src="/static/app.js"></script>
+</body>
+</html>

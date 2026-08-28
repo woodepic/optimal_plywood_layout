@@ -1,0 +1,170 @@
+:root{
+  --bg:#f6f5f2; --fg:#1c1a17; --muted:#6f6a61; --line:#d9d4cb;
+  --card:#fff; --accent:#8a5a2b; --cut:#c0392b;
+  --sidebar:300px; --bottom:280px; --cutcol:1fr;
+  --head:48px;
+}
+*{box-sizing:border-box}
+/* A class that sets `display` outranks the [hidden] attribute's own rule, so
+   elements toggled via .hidden would stay visible without this. */
+[hidden]{display:none!important}
+html,body{height:100%;margin:0;overflow:hidden}
+body{font:13.5px/1.45 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;
+     background:var(--bg);color:var(--fg);display:flex;flex-direction:column}
+
+header{height:var(--head);flex:0 0 auto;display:flex;align-items:center;gap:14px;
+       padding:0 16px;border-bottom:1px solid var(--line);background:var(--card)}
+h1{font-size:16px;margin:0;font-weight:650;letter-spacing:-.01em;white-space:nowrap}
+h2{font-size:11px;text-transform:uppercase;letter-spacing:.07em;color:var(--muted);
+   margin:0 0 9px;font-weight:600}
+.spacer{flex:1}
+.source,.status{font-size:12px;color:var(--muted);white-space:nowrap;overflow:hidden;
+                text-overflow:ellipsis}
+.status.live{color:var(--accent);font-weight:600}
+.muted{color:var(--muted);font-weight:400}
+.small{font-size:12px}
+
+/* ---- app shell: fills the viewport, panes scroll internally ---- */
+#app{flex:1;min-height:0;display:grid;grid-template-columns:var(--sidebar) 6px 1fr}
+#sidebar{min-width:0;background:var(--card);border-right:1px solid var(--line);
+         display:flex;flex-direction:column;min-height:0}
+#sidebar .scroll{flex:1;min-height:0;overflow-y:auto;padding:12px;display:flex;
+                 flex-direction:column;gap:12px}
+#main{min-width:0;min-height:0;display:grid;grid-template-rows:1fr 6px var(--bottom)}
+#viewer{position:relative;min-height:0;overflow:hidden;background:#eae6df}
+#bottom{min-height:0;display:grid;grid-template-columns:var(--cutcol) 6px 1fr;
+        background:var(--card);border-top:1px solid var(--line)}
+.pane{min-width:0;min-height:0;display:flex;flex-direction:column;padding:10px 12px}
+.pane .scroll{flex:1;min-height:0;overflow:auto}
+
+.splitter{background:transparent;position:relative;z-index:5}
+.splitter::after{content:"";position:absolute;background:var(--line);transition:background .12s}
+.splitter:hover::after,.splitter.dragging::after{background:var(--accent)}
+.splitter.vertical{cursor:col-resize}
+.splitter.vertical::after{top:0;bottom:0;left:2px;width:2px}
+.splitter.horizontal{cursor:row-resize}
+.splitter.horizontal::after{left:0;right:0;top:2px;height:2px}
+
+.panel{background:var(--card);border:1px solid var(--line);border-radius:8px;padding:12px}
+.panel.grow{flex:1;min-height:220px;display:flex;flex-direction:column}
+aside label{display:flex;justify-content:space-between;align-items:center;gap:8px;
+            margin-bottom:7px;font-size:13px}
+aside label.check{justify-content:flex-start;gap:8px}
+aside input[type=number],aside select{width:88px;padding:4px 6px;border:1px solid var(--line);
+            border-radius:5px;font:inherit;background:#fff}
+button{padding:7px 10px;border:0;border-radius:6px;font:inherit;font-weight:600;cursor:pointer}
+button.primary{width:100%;background:var(--accent);color:#fff;margin-top:4px}
+button.ghost{width:100%;background:#efeae2;color:var(--fg);margin-top:6px;font-weight:500}
+button:hover:not(:disabled){filter:brightness(1.07)}
+button:disabled{opacity:.45;cursor:default}
+.stats{margin-top:11px;font-size:12px;color:var(--muted);line-height:1.65}
+.stats b{color:var(--fg)}
+
+.parts{flex:1;min-height:0;overflow-y:auto;margin:0 -4px}
+.part{display:grid;grid-template-columns:auto auto 1fr;gap:7px;align-items:start;
+      padding:5px 5px;border-radius:5px;font-size:12px}
+.part:hover{background:#f0ece5}
+.part.excluded .pname{text-decoration:line-through;color:var(--muted)}
+.part input[type=checkbox]{margin:2px 0 0}
+.pname{cursor:text;font-weight:500;word-break:break-word}
+.pname:focus{outline:2px solid var(--accent);outline-offset:1px;border-radius:3px}
+.pdims{color:var(--muted);font-size:11px}
+.reason{color:#a04000;font-size:11px}
+
+/* ---- viewer ---- */
+#canvas{position:absolute;inset:0;width:100%;height:100%;display:block;touch-action:none;
+        cursor:grab}
+#canvas.panning{cursor:grabbing}
+.viewerbar{position:absolute;top:10px;left:10px;z-index:4;display:flex;align-items:center;
+           gap:4px;background:rgba(255,255,255,.94);border:1px solid var(--line);
+           border-radius:7px;padding:4px 6px;box-shadow:0 1px 4px rgba(0,0,0,.07)}
+.viewerbar button{background:#f1ece4;padding:3px 9px;font-size:14px;line-height:1.2}
+.viewerbar button.wide{font-size:12px;padding:4px 10px}
+#zoomLabel{font-size:11.5px;color:var(--muted);min-width:42px;text-align:center;
+           font-variant-numeric:tabular-nums}
+.viewerbar .hint{font-size:11px;color:var(--muted);margin-left:6px;padding-right:2px}
+
+.empty{position:absolute;inset:0;display:grid;place-items:center;text-align:center;padding:20px}
+.emptyinner{max-width:340px}
+.emptyinner strong{display:block;font-size:15px;margin-bottom:6px}
+.emptyinner p{color:var(--muted);margin:0 0 14px}
+
+.warnings{position:absolute;left:10px;right:10px;bottom:10px;z-index:4;
+          display:flex;flex-direction:column;gap:6px;pointer-events:none}
+.warn{background:#fff6e5;border:1px solid #e8d5a8;border-radius:7px;padding:7px 10px;
+      font-size:12px;box-shadow:0 1px 4px rgba(0,0,0,.06)}
+.warn.err{background:#fdecea;border-color:#f0b7b1}
+
+table{width:100%;border-collapse:collapse;font-size:12.5px}
+th{text-align:left;font-weight:600;color:var(--muted);font-size:11px;text-transform:uppercase;
+   letter-spacing:.05em;padding:4px 8px;border-bottom:1px solid var(--line);
+   position:sticky;top:0;background:var(--card)}
+td{padding:4px 8px;border-bottom:1px solid #efece6;vertical-align:top}
+tbody tr:hover{background:#f7f4ee}
+.num{text-align:right;font-variant-numeric:tabular-nums;white-space:nowrap}
+.cutno{display:inline-block;min-width:19px;height:19px;line-height:19px;text-align:center;
+       background:var(--cut);color:#fff;border-radius:10px;font-size:10.5px;font-weight:700}
+.grp td{font-weight:600;background:#f2eee7}
+
+.dropmask{position:fixed;inset:0;z-index:50;background:rgba(138,90,43,.13);
+          border:3px dashed var(--accent);display:grid;place-items:center;
+          font-size:17px;font-weight:600;color:var(--accent)}
+
+@media print{
+  html,body{height:auto;overflow:visible}
+  header,#sidebar,.splitter,.viewerbar,.warnings,button{display:none!important}
+  #app{display:block}#main{display:block}
+  #viewer{position:static;overflow:visible;height:auto;background:#fff}
+  #canvas{position:static;height:70vh}
+  #bottom{display:block}
+}
+
+/* ---- loading / search progress ---- */
+.loading{position:absolute;z-index:6;display:flex;pointer-events:none}
+.loading.full{inset:0;align-items:center;justify-content:center;
+              background:rgba(240,237,231,.82);backdrop-filter:blur(1.5px)}
+.loading.compact{left:0;right:0;bottom:12px;justify-content:center}
+.loadcard{background:var(--card);border:1px solid var(--line);border-radius:9px;
+          padding:12px 16px;min-width:290px;max-width:min(420px,90%);
+          box-shadow:0 3px 14px rgba(0,0,0,.11)}
+.loading.compact .loadcard{opacity:.96}
+.loadhead{display:flex;align-items:center;gap:9px;font-weight:600;font-size:13px;
+          margin-bottom:9px}
+.loaddetail{margin-top:7px;font-size:11.5px;color:var(--muted);
+            font-variant-numeric:tabular-nums}
+.bar{height:5px;border-radius:3px;background:#e8e3da;overflow:hidden}
+.bar > div{height:100%;background:var(--accent);border-radius:3px;width:0;
+           transition:width .2s linear}
+.bar.indeterminate > div{width:38%!important;animation:slide 1.05s ease-in-out infinite}
+@keyframes slide{0%{margin-left:-38%}100%{margin-left:100%}}
+.spinner{width:13px;height:13px;flex:0 0 auto;border:2px solid rgba(138,90,43,.25);
+         border-top-color:var(--accent);border-radius:50%;animation:spin .7s linear infinite}
+@keyframes spin{to{transform:rotate(360deg)}}
+
+/* ---- pane headers and the pieces/plywood toggle ---- */
+.panehead{display:flex;align-items:center;justify-content:space-between;gap:10px;
+          margin-bottom:9px}
+.panehead h2{margin:0}
+.seg{display:flex;border:1px solid var(--line);border-radius:6px;overflow:hidden;
+     flex:0 0 auto}
+.seg button{background:var(--card);color:var(--muted);border:0;padding:3px 11px;
+            font-size:11.5px;font-weight:600;cursor:pointer}
+.seg button + button{border-left:1px solid var(--line)}
+.seg button.on{background:var(--accent);color:#fff}
+.seg button:not(.on):hover{background:#f2eee7;color:var(--fg)}
+
+/* ---- plywood cost table ---- */
+.price{width:62px;padding:2px 5px;border:1px solid var(--line);border-radius:5px;
+       font:inherit;font-size:12px;text-align:right;background:#fff}
+td.stock{white-space:nowrap}
+td.stock .muted{font-size:11px}
+.price:focus{outline:2px solid var(--accent);outline-offset:1px}
+tr.total td{font-weight:700;border-top:2px solid var(--line);background:#f7f4ee}
+.costnote{padding:8px;font-size:11.5px;color:var(--muted)}
+
+/* ---- cuts that isolate a cabinet ---- */
+.cutno.sep{background:#2f3e7e}
+.septag{display:inline-block;background:#e7eaf6;color:#2f3e7e;border-radius:4px;
+        padding:0 5px;font-size:10.5px;font-weight:700;text-transform:uppercase;
+        letter-spacing:.04em;white-space:nowrap}
+td.seplead{background:#f3f5fb;color:#2f3e7e;font-size:12px;line-height:1.5}
