@@ -16,3 +16,6 @@ def find_step(substring: str) -> Path | None:
 
 CABINET = find_step("Final Assembly")     # one cabinet, 21 panels
 LAYOUT = find_step("Layout")              # six cabinets, 144 panels
+
+KITCHEN = find_step("Kitchen")     # six cabinets, 138 parts
+KITCHEN_OK = KITCHEN is not None

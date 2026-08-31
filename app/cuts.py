@@ -11,6 +11,7 @@ from collections import deque
 
 from .models import Cut
 from .nesting import SheetLayout, separating_pieces
+from .objective import cut_offset, cut_saws, schedule_cuts
 from .units import format_length
 
 
@@ -24,21 +25,90 @@ def _piece_name(n: int) -> str:
     return name
 
 
+def _cabinet_first_order(sheet: SheetLayout, cabinets: dict[str, str]) -> list[int]:
+    """Cut order that finishes one cabinet before starting the next.
+
+    For each cabinet in turn, emit every not-yet-made cut above its parts
+    (the cuts that isolate it), then every cut inside its own regions. Because
+    each cabinet's ancestors are emitted shallowest-first and shared ancestors
+    are already done, parents always precede children -- so this is a valid
+    cutting sequence, just organised around the shop workflow rather than
+    sweeping the sheet level by level.
+    """
+    parent: dict[int, int] = {}
+    depth: dict[int, int] = {0: 0}
+    stack = [0]
+    while stack:
+        pid = stack.pop()
+        for child in sheet.pieces[pid].children:
+            parent[child] = pid
+            depth[child] = depth[pid] + 1
+            stack.append(child)
+
+    by_cabinet: dict[str, list[int]] = {}
+    for pid, piece in sheet.pieces.items():
+        if piece.part_id is not None:
+            by_cabinet.setdefault(cabinets.get(piece.part_id, ""), []).append(pid)
+
+    emitted: set[int] = set()
+    sequence: list[int] = []
+    for cabinet in sorted(by_cabinet, key=lambda c: -len(by_cabinet[c])):
+        needed: set[int] = set()
+        for leaf in by_cabinet[cabinet]:
+            node = leaf
+            while node in parent:
+                node = parent[node]
+                needed.add(node)
+            needed.add(leaf)
+        for pid in sorted(needed, key=lambda x: depth[x]):
+            if pid not in emitted and sheet.pieces[pid].cut is not None:
+                emitted.add(pid)
+                sequence.append(pid)
+
+    # Anything left over lives under offcut-only branches; append shallowest first.
+    for pid in sorted(sheet.pieces, key=lambda x: depth.get(x, 0)):
+        if sheet.pieces[pid].cut is not None and pid not in emitted:
+            emitted.add(pid)
+            sequence.append(pid)
+    return sequence
+
+
 def order_cuts(sheet: SheetLayout, sheet_index: int, part_labels: dict[str, str],
                units: str = "in",
-               cabinets: dict[str, str] | None = None) -> list[Cut]:
-    """Walk the split tree breadth-first and emit the cut list for one sheet."""
-    # Cuts that still have more than one cabinet below them: make these and the
-    # remaining pieces can be sorted into per-cabinet piles.
+               cabinets: dict[str, str] | None = None,
+               miter_capacity: float = 304.8,
+               prefer: str = "stops",
+               start_width: float | None = None) -> list[Cut]:
+    """Emit one sheet's cuts in a valid, workable order.
+
+    Two orderings are useful and they pull against each other, so the caller
+    picks by what is ranked higher:
+
+    "stops"    keep the track saw's stop still as long as possible, so several
+               cuts of one width happen together and nothing is re-measured.
+    "cabinets" make the cuts that isolate a cabinet first, so parts can be
+               sorted into piles early.
+
+    Either way a piece is always cut before its children, so the sequence is
+    physically valid.
+    """
     isolating = separating_pieces(sheet, cabinets) if cabinets else set()
+    saws = cut_saws(sheet, miter_capacity)
+
+    if prefer == "cabinets" and cabinets:
+        sequence = _cabinet_first_order(sheet, cabinets)
+    else:
+        sequence = schedule_cuts(sheet, miter_capacity, start_width)
+
     counter = 0
     sheet.pieces[0].label = _piece_name(counter)
     counter += 1
 
     cuts: list[Cut] = []
-    queue: deque[int] = deque([0])
-    while queue:
-        pid = queue.popleft()
+    group = 0
+    width_now = start_width
+
+    for pid in sequence:
         piece = sheet.pieces[pid]
         if piece.cut is None:
             continue
@@ -52,7 +122,6 @@ def order_cuts(sheet: SheetLayout, sheet_index: int, part_labels: dict[str, str]
                 counter += 1
             else:
                 child.label = "offcut"
-            queue.append(child_id)
 
         axis = piece.cut.axis
         if axis == "V":
@@ -67,6 +136,15 @@ def order_cuts(sheet: SheetLayout, sheet_index: int, part_labels: dict[str, str]
             x1, x2 = piece.x, piece.x + piece.w
             from_edge = "bottom"
             verb = "Crosscut"
+
+        # Track cuts at one stop setting form a run; a miter cut does not
+        # disturb the stop, so it stays in whatever run surrounds it.
+        saw = saws.get(pid, "track")
+        if saw == "track":
+            rounded = round(offset, 1)
+            if width_now is None or rounded != width_now:
+                group += 1
+                width_now = rounded
 
         produced_list = [sheet.pieces[c].label for c in piece.children]
         produced = " + ".join(produced_list)
@@ -87,6 +165,8 @@ def order_cuts(sheet: SheetLayout, sheet_index: int, part_labels: dict[str, str]
             piece_h=piece.h,
             produces=produced_list,
             separates=pid in isolating,
+            saw=saw,
+            stop_group=group if saw == "track" else 0,
             note=note,
         ))
     return cuts

@@ -3,6 +3,22 @@
 const MM_PER_IN = 25.4;
 const $ = (id) => document.getElementById(id);
 
+/* One colour per stop measurement, so equal-width track cuts are visibly a set.
+   Hue only -- the line colour still says which saw. */
+const STOP_HUES = [8, 40, 70, 140, 175, 205, 250, 285, 315, 340];
+function stopColour(offset) {
+  if (!RESULT || !RESULT.stop_plan) return 'hsl(0 0% 60%)';
+  const widths = [...new Set(RESULT.stop_plan.map(r => Math.round(r.width_mm * 10)))]
+    .sort((a, b) => a - b);
+  const i = widths.indexOf(Math.round(offset * 10));
+  if (i < 0) return 'hsl(0 0% 60%)';
+  return `hsl(${STOP_HUES[i % STOP_HUES.length]} 62% 45%)`;
+}
+
+const SAW_COLOUR = {
+  miter: '#1f8a4c',   // chop saw: the easy cuts
+  track: '#c0392b',   // track saw
+};
 const BADGE_PX = 9;       // cut-number radius in screen px once zoomed in
 const BADGE_MAX_MM = 33;  // but never larger than this on the sheet itself
 const GAP = 260;        // mm of space between sheets on the canvas
@@ -15,6 +31,42 @@ let OVERRIDES = {};
 let RESULT = null;
 let runToken = 0;       // guards against a stale run overwriting a newer one
 let bomMode = localStorage.getItem('ply.bomMode') || 'pieces';
+
+const CRITERIA = [
+  ['stopchanges', 'Track saw stop changes'],
+  ['trackcuts', 'Track saw cuts'],
+  ['staged', 'Saw changes'],
+  ['mitercuts', 'Mitre saw cuts'],
+  ['offcut', 'Largest offcut'],
+  ['grouping', 'Cuts to sort by cabinet'],
+];
+const DEFAULT_PRIORITIES = ['stopchanges', 'trackcuts', 'staged',
+                            'mitercuts', 'offcut', 'grouping'];
+let PRIORITIES = DEFAULT_PRIORITIES.slice();
+try {
+  const saved = JSON.parse(localStorage.getItem('ply.priorities') || 'null');
+  if (Array.isArray(saved) && saved.length === DEFAULT_PRIORITIES.length) PRIORITIES = saved;
+} catch (_) { /* keep the default */ }
+
+function renderPriorities() {
+  const names = Object.fromEntries(CRITERIA);
+  $('priorities').innerHTML = PRIORITIES.map((key, i) => `<li>
+      <span class="name">${names[key] || key}</span>
+      <button data-i="${i}" data-d="-1" ${i === 0 ? 'disabled' : ''} title="Move up">\u25b2</button>
+      <button data-i="${i}" data-d="1" ${i === PRIORITIES.length - 1 ? 'disabled' : ''}
+              title="Move down">\u25bc</button>
+    </li>`).join('');
+  $('priorities').querySelectorAll('button').forEach(b => {
+    b.onclick = () => {
+      const i = +b.dataset.i, j = i + (+b.dataset.d);
+      if (j < 0 || j >= PRIORITIES.length) return;
+      [PRIORITIES[i], PRIORITIES[j]] = [PRIORITIES[j], PRIORITIES[i]];
+      localStorage.setItem('ply.priorities', JSON.stringify(PRIORITIES));
+      renderPriorities();
+      solve();
+    };
+  });
+}
 
 // Sheet prices, CAD. Only these two are known -- any other thickness starts
 // blank and is left out of the total until you fill it in, rather than being
@@ -115,7 +167,7 @@ async function loadSample() {
     if (!r.ok) throw new Error((await r.json()).detail || 'could not load sample');
     adoptUpload(await r.json());
   });
-  await solve();
+  await previewFloor();
 }
 
 async function uploadFile(file) {
@@ -129,10 +181,13 @@ async function uploadFile(file) {
     if (!r.ok) throw new Error((await r.json()).detail || 'upload failed');
     adoptUpload(await r.json());
   });
-  await solve();
+  await previewFloor();
 }
 
 /* Wraps an async step so the status indicator can never be left stuck on. */
+let PREVIEW = false;    // showing the floor-only layout, awaiting a real run
+let previewing = false;
+
 async function withRun(fn) {
   const token = ++runToken;
   try {
@@ -161,6 +216,15 @@ function adoptUpload(data) {
   renderWarnings(data.warnings);
 }
 
+/* Opening a file runs only far enough to establish the plywood floor. A full
+   ranked search before the user has said what matters wastes their time and
+   ours -- and the answer would change the moment they touched the ranking. */
+async function previewFloor() {
+  PREVIEW = true;
+  await solve({ floorOnly: true });
+  PREVIEW = false;
+}
+
 /* ================= solving ================= */
 
 function currentParams() {
@@ -169,8 +233,12 @@ function currentParams() {
     sheet_width_mm: inToMm($('sheetW').value),
     sheet_length_mm: inToMm($('sheetL').value),
     edge_trim_mm: inToMm($('trim').value),
+    min_offcut_mm: inToMm($('minOff').value),
     effort: $('effort').value,
-    mode: $('mode').value,
+    priorities: PRIORITIES.slice(),
+    continuous_grain: $('grainRun').checked,
+    max_sheets: $('maxSheets').value === '' ? null : +$('maxSheets').value,
+    floor_only: false,
     // Keep searching after the first answer lands; the stream stays open and
     // pushes a better layout if it finds one.
     background_seconds: $('keepGoing').checked ? 600 : 0,
@@ -178,11 +246,16 @@ function currentParams() {
   };
 }
 
-async function solve() {
+async function solve(runOpts) {
   if (!JOB) return;
+  const floorOnly = !!(runOpts && runOpts.floorOnly);
   const token = ++runToken;
   settled = false;
-  const body = JSON.stringify({ job_id: JOB, params: currentParams(), overrides: OVERRIDES });
+  previewing = floorOnly;
+  const params = currentParams();
+  params.floor_only = floorOnly;
+  if (floorOnly) params.background_seconds = 0;
+  const body = JSON.stringify({ job_id: JOB, params, overrides: OVERRIDES });
   const opts = { method: 'POST', headers: { 'Content-Type': 'application/json' }, body };
   $('warnings').innerHTML = '';
 
@@ -232,6 +305,18 @@ async function solve() {
 
 let bestSoFar = null;
 let settled = false;   // a full result is on screen; further work is refinement
+let VIEWING = 0;       // 0 = the chosen layout, 1.. = a runner-up
+
+/* The layout currently on screen. Runner-ups carry their own sheets and stats,
+   so browsing them never disturbs the chosen result. */
+function viewed() {
+  const alts = (RESULT && RESULT.alternatives) || [];
+  if (VIEWING > 0 && alts[VIEWING - 1]) {
+    const alt = alts[VIEWING - 1];
+    return { sheets: alt.sheets, stats: alt.stats };
+  }
+  return { sheets: RESULT.sheets, stats: RESULT.stats };
+}
 
 function handleFrame(frame, token) {
   if (token !== runToken) return;
@@ -275,7 +360,22 @@ function handleFrame(frame, token) {
   }
 
   bestSoFar = null;
+  VIEWING = 0;
   RESULT = frame.payload;
+  canvas.classList.toggle('preview', previewing);
+  setHidden($('previewNote'), !previewing);
+  if (RESULT.sheet_floor) {
+    const box = $('maxSheets');
+    // The area bound is what no layout can beat; the floor is the best we have
+    // actually packed. Let the box reach the bound so a tighter target can be
+    // asked for -- but default to what is known achievable.
+    const bound = RESULT.sheet_bound || RESULT.sheet_floor;
+    box.min = bound;
+    if (box.value === '' || +box.value < bound) box.value = RESULT.sheet_floor;
+    $('sheetFloor').textContent = bound < RESULT.sheet_floor
+      ? `best ${RESULT.sheet_floor} · bound ${bound}`
+      : `floor ${RESULT.sheet_floor}`;
+  }
   settled = true;
   hideLoading();
   renderAll();
@@ -290,6 +390,7 @@ function effective(p) {
   return {
     included: o.included !== undefined ? o.included : p.included,
     grain_locked: o.grain_locked !== undefined ? o.grain_locked : p.grain_locked,
+    grain_match: o.grain_match !== undefined ? o.grain_match : p.grain_match,
     label: o.label || p.label,
   };
 }
@@ -338,7 +439,19 @@ function renderParts() {
       why.className = 'reason'; why.textContent = p.reject_reason;
       info.append(why);
     }
-    row.append(inc, lock, info);
+    // Which faces form a cabinet's continuous grain run. Pre-ticked by name and
+    // size; correct it here when the guess is wrong.
+    const grain = document.createElement('input');
+    grain.type = 'checkbox';
+    grain.checked = st.grain_match;
+    grain.title = 'Part of this cabinet\u2019s continuous grain run';
+    grain.className = 'grainbox';
+    grain.onchange = () => {
+      setOverride(p.id, { grain_match: grain.checked });
+      if ($('grainRun').checked) solve();
+    };
+
+    row.append(inc, lock, grain, info);
     box.append(row);
   });
 }
@@ -370,6 +483,13 @@ function rescaleBadges(rect) {
   canvas.querySelectorAll('.cutbadge').forEach(g => {
     g.setAttribute('transform',
       `translate(${g.dataset.cx},${g.dataset.cy}) scale(${k})`);
+  });
+  // Stop markers follow the same rule, a little smaller so they read as
+  // annotation rather than competing with the cut numbers.
+  const d = Math.min(BADGE_PX * 0.62 * (view.w / box.width), BADGE_MAX_MM * 0.62);
+  canvas.querySelectorAll('.stopdot').forEach(g => {
+    g.setAttribute('transform',
+      `translate(${g.dataset.cx},${g.dataset.cy}) scale(${d})`);
   });
 }
 
@@ -554,13 +674,21 @@ function renderCanvas(sheets, stats, groups) {
       const mx = c.x1 + (c.x2 - c.x1) * f, my = y1 + (y2 - y1) * f;
       // The badge is drawn at unit size and scaled in applyView(), so it stays
       // the same size on screen instead of swelling over the labels as you zoom.
-      // Cuts that isolate a cabinet are the ones worth doing first, so they get
-      // a solid dark line instead of the ordinary dashed red.
-      const col = c.separates ? '#2f3e7e' : '#c0392b';
+      // Colour says which saw: green you chop at home, red means setting the
+      // track back up, blue is a full-length rip the store can do for you.
+      // Isolating cuts stay solid and heavier so they still stand out.
+      const col = SAW_COLOUR[c.saw] || SAW_COLOUR.track;
       const dash = c.separates ? '' : ' stroke-dasharray="7 5"';
+      // Colour a tick by the stop measurement, so cuts you can make without
+      // touching the saw carry the same marker.
+      const stopHue = c.saw === 'track' ? stopColour(c.offset_mm) : null;
+      const wide = c.separates ? 3 : 2.2;
       return `<g><line x1="${c.x1}" y1="${y1}" x2="${c.x2}" y2="${y2}"
-          stroke="${col}" stroke-width="${c.separates ? 2.4 : 1.5}"${dash}
-          vector-effect="non-scaling-stroke"/>
+          stroke="${col}" stroke-width="${wide}"${dash}
+          data-off="${c.saw === 'track' ? c.offset_mm.toFixed(1) : ''}"
+          data-base="${wide}" vector-effect="non-scaling-stroke"/>
+        ${stopHue === null ? '' : `<g class="stopdot" data-cx="${c.x1}" data-cy="${y1}">
+          <circle r="1" fill="${stopHue}" stroke="#fff" stroke-width="0.22"/></g>`}
         <g class="cutbadge" data-cx="${mx}" data-cy="${my}">
           <circle r="1" fill="${col}" stroke="#fff" stroke-width="0.17"/>
           <text y="0.37" text-anchor="middle" font-size="1.15"
@@ -603,17 +731,71 @@ function inferGroups(sheets) {
 
 function renderAll() {
   if (!RESULT) return;
+  const view = viewed();
   renderWarnings(RESULT.warnings);
-  renderStats(RESULT.stats, RESULT.groups);
-  renderCanvas(RESULT.sheets, RESULT.stats, RESULT.groups);
+  renderReport(RESULT.report);
+  $('prove').disabled = false;
+  renderCandidates();
+  renderStats(view.stats, RESULT.groups);
+  renderCanvas(view.sheets, view.stats, RESULT.groups);
   renderCutList();
+  renderStopPlan();
   renderBom();
   renderParts();
+}
+
+/* Runner-up layouts, with the numbers that distinguish them. A candidate that
+   scores worse on the ranking may still be the one that suits the shop. */
+function renderCandidates() {
+  const alts = (RESULT && RESULT.alternatives) || [];
+  const host = $('candidates');
+  if (!alts.length) { setHidden(host, true); return; }
+  setHidden(host, false);
+
+  // `sheets` is not a ranked criterion any more, so it is absent from the
+  // report -- take it from the stats or the chip reads "NaN sheets".
+  const best = Object.fromEntries((RESULT.report || []).map(c => [c.key, c.value]));
+  best.sheets = RESULT.stats.sheets;
+  const entries = [{ label: 'Chosen', values: best }].concat(
+    alts.map(a => ({ label: a.label, values: a.values || {} })));
+
+  host.innerHTML = entries.map((e, i) => {
+    const v = e.values;
+    // Show what actually separates the candidates, or two of them read alike.
+    const bits = [`${v.sheets ?? '?'} sheets`,
+                  `${Math.round(v.trackcuts)} track`,
+                  `${Math.round(v.stopchanges)} stops`,
+                  `${Math.round(v.staged)} swaps`];
+    return `<button class="cand${i === VIEWING ? ' on' : ''}" data-i="${i}">
+      <b>${escapeHtml(e.label)}</b><span>${bits.join(' · ')}</span></button>`;
+  }).join('');
+
+  host.querySelectorAll('.cand').forEach(b => {
+    b.onclick = () => {
+      VIEWING = +b.dataset.i;
+      view.adjusted = false;      // refit: a runner-up may use a different count
+      renderAll();
+    };
+  });
 }
 
 function renderWarnings(list) {
   $('warnings').innerHTML = (list || []).map(w =>
     '<div class="warn">' + escapeHtml(w) + '</div>').join('');
+}
+
+function renderReport(report) {
+  if (!report || !report.length) return;
+  const fmtVal = (c) => c.key === 'offcut'
+    ? fmt(Math.sqrt(Math.max(0, -c.value)))          // side of an equivalent square
+    : (+c.value).toLocaleString();
+  $('report').innerHTML = '<table><tbody>' + report.map(c => {
+    const badge = c.bound === null || c.bound === undefined ? ''
+      : c.optimal ? '<span class="badge ok">optimal</span>'
+      : `<span class="badge gap">floor ${(+c.bound).toLocaleString()}</span>`;
+    return `<tr><td>#${c.rank}</td><td>${escapeHtml(c.label)}</td>
+      <td class="v">${escapeHtml(fmtVal(c))}</td><td>${badge}</td></tr>`;
+  }).join('') + '</tbody></table>';
 }
 
 function renderStats(stats, groups) {
@@ -624,7 +806,23 @@ function renderStats(stats, groups) {
 
   const lines = [`<div>Total sheets: <b>${stats.sheets}</b></div>`, byGroup];
   if (stats.yield_pct !== undefined) lines.push(`<div>Material used: <b>${stats.yield_pct}%</b></div>`);
-  if (stats.total_cuts !== undefined) lines.push(`<div>Cuts: <b>${stats.total_cuts}</b></div>`);
+  if (stats.total_cuts !== undefined) {
+    // Break the total down by which saw does the work.
+    const by = Object.fromEntries((RESULT && RESULT.report || [])
+      .map(c => [c.key, c.value]));
+    const track = by.trackcuts, miter = by.mitercuts;
+    let detail = '';
+    if (track !== undefined && miter !== undefined) {
+      const swaps = by.staged, stops = by.stopchanges;
+      detail = `<div class="cutsplit">`
+        + `<span>${miter} mitre</span>`
+        + `<span class="heavy">${track} track saw</span>`
+        + (swaps !== undefined ? `<span>${swaps} saw change${swaps === 1 ? '' : 's'}</span>` : '')
+        + (stops !== undefined ? `<span>${stops} stop change${stops === 1 ? '' : 's'}</span>` : '')
+        + `</div>`;
+    }
+    lines.push(`<div>Cuts: <b>${stats.total_cuts}</b></div>${detail}`);
+  }
   if (stats.separating_cuts) {
     lines.push(`<div>Cuts to sort by cabinet: <b>${stats.separating_cuts}</b>`
       + (stats.total_cuts ? ` of ${stats.total_cuts}` : '') + `</div>`);
@@ -646,9 +844,9 @@ function cutSentence(c) {
 }
 
 function renderCutList() {
-  const sep = RESULT.stats.separating_cuts;
-  $('cutCount').textContent = RESULT.stats.total_cuts
-    ? '(' + RESULT.stats.total_cuts + ' cuts'
+  const sep = viewed().stats.separating_cuts;
+  $('cutCount').textContent = viewed().stats.total_cuts
+    ? '(' + viewed().stats.total_cuts + ' cuts'
       + (sep ? ', ' + sep + ' isolating' : '') + ')' : '';
   const rows = [];
   if (sep) {
@@ -656,7 +854,7 @@ function renderCutList() {
       <span class="septag">isolating</span> cuts first — after those
       ${sep} cuts, every piece belongs to a single cabinet.</td></tr>`);
   }
-  RESULT.sheets.forEach((sheet, i) => {
+  viewed().sheets.forEach((sheet, i) => {
     const g = groupOf(sheet.group_id, RESULT.groups);
     rows.push(`<tr class="grp"><td colspan="2">Sheet ${i + 1}${g && g.nominal ? ' — ' + g.nominal : ''}
       (${sheet.cuts.length} cuts)</td></tr>`);
@@ -669,6 +867,35 @@ function renderCutList() {
   $('cutlist').innerHTML = rows.length
     ? '<table><tbody>' + rows.join('') + '</tbody></table>'
     : '<p class="muted small">No cuts.</p>';
+}
+
+/* Every run of track cuts that shares a stop, in cutting order. Hovering a row
+   lights up the cuts it covers, so you can see what one stop setting buys. */
+function renderStopPlan() {
+  const runs = (RESULT && RESULT.stop_plan) || [];
+  const host = $('stopplan');
+  if (!runs.length) { host.innerHTML = '<p class="muted small">No track cuts.</p>'; return; }
+
+  host.innerHTML = '<table><thead><tr><th>#</th><th class="num">Stop</th>'
+    + '<th class="num">Cuts</th></tr></thead><tbody>'
+    + runs.map(r => `<tr class="stoprow" data-w="${r.width_mm}">
+        <td class="num"><span class="swatch" style="background:${stopColour(r.width_mm)}"></span>${r.index}</td>
+        <td class="num"><b>${escapeHtml(fmt(r.width_mm))}</b></td>
+        <td class="num">${r.count}</td></tr>`).join('')
+    + '</tbody></table>';
+
+  host.querySelectorAll('.stoprow').forEach(row => {
+    row.onmouseenter = () => highlightStop(+row.dataset.w);
+    row.onmouseleave = () => highlightStop(null);
+  });
+}
+
+function highlightStop(width) {
+  canvas.querySelectorAll('line[data-off]').forEach(line => {
+    const on = width !== null && Math.abs(+line.dataset.off - width) < 0.15;
+    line.setAttribute('stroke-width', on ? 4 : (line.dataset.base || 1.5));
+    line.setAttribute('opacity', width === null || on ? 1 : 0.25);
+  });
 }
 
 function renderBom() {
@@ -756,20 +983,30 @@ function renderSheetBom() {
 $('bomPieces').onclick = () => { bomMode = 'pieces'; localStorage.setItem('ply.bomMode', bomMode); if (RESULT) renderBom(); else setSeg(); };
 $('bomSheets').onclick = () => { bomMode = 'sheets'; localStorage.setItem('ply.bomMode', bomMode); if (RESULT) renderBom(); else setSeg(); };
 setSeg();
+renderPriorities();
 
 /* ================= draggable splitters ================= */
 
 function makeSplitter(el, opts) {
-  // Only trust a well-formed pixel value. A malformed one (older version, hand
-  // edited, different units) would silently collapse the whole grid layout.
-  const saved = localStorage.getItem(opts.key);
-  const px = saved && /^\d+(\.\d+)?px$/.test(saved.trim())
-    ? parseFloat(saved) : null;
-  if (px !== null && px >= opts.min) {
-    opts.target.style.setProperty(opts.varName, px + 'px');
-  } else if (saved) {
-    localStorage.removeItem(opts.key);
-  }
+  /* Re-clamp a restored size against the window it is being restored into.
+     A value dragged small on a laptop was being honoured verbatim on a big
+     screen, which is how the cut list ended up 72px tall with its content --
+     and the plywood total -- hidden below the fold. */
+  const applySaved = () => {
+    const saved = localStorage.getItem(opts.key);
+    if (!saved || !/^\d+(\.\d+)?px$/.test(saved.trim())) {
+      if (saved) localStorage.removeItem(opts.key);
+      return;
+    }
+    const box = opts.container.getBoundingClientRect();
+    const span = opts.axis === 'x' ? box.width : box.height;
+    if (!span) return;
+    const floor = Math.max(opts.min, span * (opts.minFrac || 0));
+    const value = Math.min(Math.max(parseFloat(saved), floor), opts.max(box));
+    opts.target.style.setProperty(opts.varName, Math.round(value) + 'px');
+  };
+  applySaved();
+  new ResizeObserver(applySaved).observe(opts.container);
 
   el.addEventListener('pointerdown', (e) => {
     e.preventDefault();
@@ -806,21 +1043,55 @@ makeSplitter($('vsplit'), {
 });
 makeSplitter($('hsplit'), {
   key: 'ply.bottom', varName: '--bottom', target: $('main'), container: $('main'),
-  axis: 'y', min: 90, max: (box) => box.height - 160,
+  // A quarter of the height at minimum: three panes of tables need the room.
+  axis: 'y', min: 150, minFrac: 0.24, max: (box) => box.height - 200,
 });
 makeSplitter($('bsplit'), {
   key: 'ply.cutcol', varName: '--cutcol', target: $('bottom'), container: $('bottom'),
-  axis: 'x', min: 200, max: (box) => box.width - 220,
+  axis: 'x', min: 220, max: (box) => box.width * 0.5,
+});
+makeSplitter($('ssplit'), {
+  key: 'ply.stopcol', varName: '--stopcol', target: $('bottom'), container: $('bottom'),
+  axis: 'x', min: 200, max: (box) => box.width * 0.75,
 });
 
 /* ================= wiring ================= */
 
-['sheetW', 'sheetL', 'kerf', 'trim', 'effort', 'mode', 'keepGoing'].forEach(id =>
-  $(id).addEventListener('change', solve));
+['sheetW', 'sheetL', 'kerf', 'trim', 'minOff', 'effort', 'keepGoing',
+  'grainRun', 'maxSheets'].forEach(id => $(id).addEventListener('change', solve));
 $('units').addEventListener('change', () => { if (RESULT) renderAll(); renderParts(); });
 $('showCuts').addEventListener('change', () => RESULT && renderAll());
 $('showOutlines').addEventListener('change', () => RESULT && renderAll());
-$('solve').addEventListener('click', solve);
+$('solve').addEventListener('click', () => solve());
+
+$('prove').addEventListener('click', async () => {
+  if (!JOB) return;
+  const btn = $('prove');
+  btn.disabled = true;
+  $('proof').innerHTML = '<span class="muted">Searching exhaustively\u2026</span>';
+  try {
+    const r = await fetch('/api/prove', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ job_id: JOB, params: currentParams(), overrides: OVERRIDES }),
+    });
+    if (!r.ok) throw new Error((await r.json()).detail || 'proof failed');
+    const p = await r.json();
+    const better = p.sheets.filter(s => s.status === 'a better arrangement exists');
+    $('proof').innerHTML =
+      `<div><b class="ok">${p.proven_sheets}</b> of ${p.total_sheets} sheets proven to use
+        the fewest possible cuts.</div>` +
+      (better.length
+        ? `<div><b>${better.length}</b> sheet(s) can be improved: ` +
+          better.map(s => `#${s.sheet} (${s.current}\u2192${s.best})`).join(', ') + '</div>'
+        : '') +
+      `<div>${p.total_sheets - p.proven_sheets - better.length} sheet(s) too large to
+        finish \u2014 no claim made about those.</div>`;
+  } catch (e) {
+    $('proof').innerHTML = '<span class="muted">' + escapeHtml(String(e.message || e)) + '</span>';
+  } finally {
+    btn.disabled = false;
+  }
+});
 $('pick').onclick = $('pick2').onclick = () => $('file').click();
 $('file').addEventListener('change', (e) => {
   if (e.target.files[0]) uploadFile(e.target.files[0]);

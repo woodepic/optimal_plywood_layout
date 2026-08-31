@@ -71,37 +71,59 @@ recognizable.
   $48.98 for 1/2" and $68.88 for 3/4", CAD); a stock with no price set is left
   out of the total rather than costed at a made-up number.
 
-## Three goals
+## Ranked priorities
 
-Pick one with the **Goal** selector; each re-solves.
+There are no modes. You rank what matters and the solver obeys, comparing layouts
+lexicographically: rank 1 always wins, the rest break ties.
 
-| Goal | Optimises for | Cost |
-|---|---|---|
-| **Least plywood** | Fewest sheets, then one big reusable offcut | the default |
-| **Fewest cuts** | Least time at the saw, grouping same-size parts into strips | usually free |
-| **Group cabinets** | Fewest cuts before parts can be sorted by cabinet | usually free |
+| Criterion | Meaning |
+|---|---|
+| Plywood sheets | how many sheets you buy |
+| Cuts to sort by cabinet | cuts that must happen before parts can be piled up per cabinet |
+| Total cuts | saw passes |
+| Cutting stages | how many times the cut direction changes; 2 is rips-then-crosscuts |
+| Largest offcut | biggest single reusable piece |
 
-*Fewest cuts* prices each extra sheet at 20 cuts, so the search cannot "win" by
-scattering parts thinly over near-empty sheets.
+Ranking *Plywood sheets* first never costs a sheet: the search first finds the
+tightest pack it can using a density-guided surrogate, then optimises whatever you
+ranked next while holding that sheet count.
 
-*Group cabinets* packs just as densely as the default — it does **not** buy extra
-sheets — but arranges each cabinet's parts into contiguous regions so that a
-handful of cuts separates them. The metric it minimises is the number of cuts
-that still have more than one cabinet below them in the guillotine tree: make
-those and every remaining piece belongs to one cabinet. Those cuts are drawn as
-**solid blue lines with blue numbers** and tagged *isolating* in the cut list, so
-you can make them first and end up with a pile per cabinet before doing any of
-the detail cutting.
+### The identity behind "Total cuts"
 
-Measured on `My Kitchen.step` (138 parts, 6 cabinets, Normal effort):
+A guillotine layout is a tree, so exactly:
 
-| Goal | Sheets | Total cuts | Cuts to sort by cabinet |
-|---|---|---|---|
-| Least plywood | 15 | 236 | 109 |
-| Fewest cuts | 15 | **198** | 126 |
-| Group cabinets | 15 | 242 | **37** |
+```
+cuts = parts + scrap pieces + trim cuts - sheets
+```
 
-Same plywood, six more cuts, and a third of the sorting work.
+Minimising cuts is therefore *exactly* minimising the number of separate scrap
+pieces — not scrap area. Every extra offcut costs one more pass. (The trim term is
+for cuts whose remainder is narrower than the blade: the cut happens, but the
+material becomes sawdust, so it adds a cut without adding a piece.)
+
+It also gives a certified floor: `cuts >= parts - sheets`.
+
+## Certified bounds and the prover
+
+Every criterion is shown against a provable lower bound. Meeting one is a proof of
+optimality; missing one shows the exact remaining gap and claims nothing more.
+
+**Prove optimality** runs an exhaustive branch-and-bound per sheet. It explores the
+whole space but abandons branches a bound proves cannot win, so a completed search
+is a real proof — "everything not tried was provably worse". Sheets of up to about
+eight parts finish and are proven; larger ones time out and are reported as
+unproven rather than dressed up as a proof. Its pruning is checked against literal
+enumeration on instances small enough to enumerate.
+
+Naive brute force is not on the table at real sizes: 138 parts have 2^138 ~ 3.5e41
+orientation combinations alone, which is beyond any hardware.
+
+## Blade and offcuts
+
+Offcuts thinner than the saw blade are kept — there is no minimum-offcut rule. Set
+**Min offcut** above 0 to discard slivers below a width instead. A remainder
+*smaller* than the kerf cannot survive whatever the setting: the blade consumes
+that material.
 
 ## Using the window
 
@@ -146,7 +168,7 @@ tests/
 .venv/bin/python -m pytest tests/ -q
 ```
 
-89 tests covering kerf arithmetic, the guillotine invariants, instance-name
+110 tests covering kerf arithmetic, the guillotine invariants, instance-name
 normalisation, the streaming search, all three goals, the separating-cut metric,
 background refinement, and the HTTP API. Hard expectations against
 the real cabinet: 21 panels, three distinct drawers, no collapsed duplicate names,

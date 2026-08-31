@@ -98,10 +98,10 @@ def test_bom_groups_the_three_identical_drawer_bottoms(cabinet):
 
 def test_full_solve_is_valid_and_fits_two_sheets(cabinet):
     result = solve(cabinet, LayoutParams(effort="normal"))
-    assert result.stats["sheets"] == 2
     assert not any("validation failed" in w for w in result.warnings)
     placed = {p.panel_id for s in result.sheets for p in s.placements}
     assert len(placed) == 21
+    assert result.stats["sheets"] == 2
 
 
 def test_cut_list_is_ordered_and_measurable(cabinet):

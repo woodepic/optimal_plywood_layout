@@ -1,7 +1,7 @@
 :root{
   --bg:#f6f5f2; --fg:#1c1a17; --muted:#6f6a61; --line:#d9d4cb;
   --card:#fff; --accent:#8a5a2b; --cut:#c0392b;
-  --sidebar:300px; --bottom:280px; --cutcol:1fr;
+  --sidebar:300px; --bottom:320px; --cutcol:1.1fr; --stopcol:0.8fr;
   --head:48px;
 }
 *{box-sizing:border-box}
@@ -32,7 +32,7 @@ h2{font-size:11px;text-transform:uppercase;letter-spacing:.07em;color:var(--mute
                  flex-direction:column;gap:12px}
 #main{min-width:0;min-height:0;display:grid;grid-template-rows:1fr 6px var(--bottom)}
 #viewer{position:relative;min-height:0;overflow:hidden;background:#eae6df}
-#bottom{min-height:0;display:grid;grid-template-columns:var(--cutcol) 6px 1fr;
+#bottom{min-height:0;display:grid;grid-template-columns:var(--cutcol) 6px var(--stopcol) 6px 1fr;
         background:var(--card);border-top:1px solid var(--line)}
 .pane{min-width:0;min-height:0;display:flex;flex-direction:column;padding:10px 12px}
 .pane .scroll{flex:1;min-height:0;overflow:auto}
@@ -61,7 +61,7 @@ button:disabled{opacity:.45;cursor:default}
 .stats b{color:var(--fg)}
 
 .parts{flex:1;min-height:0;overflow-y:auto;margin:0 -4px}
-.part{display:grid;grid-template-columns:auto auto 1fr;gap:7px;align-items:start;
+.part{display:grid;grid-template-columns:auto auto auto 1fr;gap:7px;align-items:start;
       padding:5px 5px;border-radius:5px;font-size:12px}
 .part:hover{background:#f0ece5}
 .part.excluded .pname{text-decoration:line-through;color:var(--muted)}
@@ -168,3 +168,65 @@ tr.total td{font-weight:700;border-top:2px solid var(--line);background:#f7f4ee}
         padding:0 5px;font-size:10.5px;font-weight:700;text-transform:uppercase;
         letter-spacing:.04em;white-space:nowrap}
 td.seplead{background:#f3f5fb;color:#2f3e7e;font-size:12px;line-height:1.5}
+
+/* ---- ranked priorities ---- */
+.prio{list-style:none;margin:0;padding:0;counter-reset:p}
+.prio li{display:flex;align-items:center;gap:6px;padding:4px 0;font-size:12.5px}
+.prio li::before{counter-increment:p;content:counter(p);width:17px;height:17px;
+  flex:0 0 auto;border-radius:9px;background:var(--accent);color:#fff;font-size:10.5px;
+  font-weight:700;display:grid;place-items:center}
+.prio .name{flex:1;min-width:0}
+.prio button{background:#efeae2;border:0;border-radius:4px;padding:1px 6px;
+  font-size:11px;cursor:pointer;line-height:1.4}
+.prio button:disabled{opacity:.3;cursor:default}
+
+/* ---- criterion report ---- */
+.report table{font-size:12px}
+.report td{padding:3px 5px;border:0}
+.report .v{text-align:right;font-variant-numeric:tabular-nums;font-weight:600}
+.badge{font-size:10px;font-weight:700;border-radius:4px;padding:0 5px;
+  text-transform:uppercase;letter-spacing:.04em;white-space:nowrap}
+.badge.ok{background:#e3f2e6;color:#1f6b33}
+.badge.gap{background:#f0ece4;color:var(--muted)}
+.proof{margin-top:9px;font-size:11.5px;color:var(--muted);line-height:1.6}
+.proof b{color:var(--fg)}
+.proof .ok{color:#1f6b33;font-weight:700}
+
+/* ---- which saw does each cut ---- */
+.cutsplit{display:flex;flex-wrap:wrap;gap:4px;margin:3px 0 5px}
+.cutsplit span{background:#efeae2;border-radius:4px;padding:1px 6px;font-size:11px;
+               color:var(--muted);white-space:nowrap}
+.cutsplit span.heavy{background:#f4e2de;color:#a0402c;font-weight:600}
+
+/* the grain-run tick reads as a third state, distinct from include/lock */
+.grainbox{accent-color:#7a5aa8}
+
+/* ---- which saw makes each cut ---- */
+.sawkey{display:flex;align-items:center;gap:5px;font-size:11px;color:var(--muted);
+        margin-left:8px;white-space:nowrap}
+.sawkey b{width:9px;height:3px;border-radius:2px;background:var(--c);display:inline-block;
+          margin-left:5px}
+.sawkey b:first-child{margin-left:0}
+
+/* ---- runner-up layouts ---- */
+.candidates{position:absolute;top:10px;right:10px;z-index:4;display:flex;gap:5px;
+            flex-wrap:wrap;justify-content:flex-end;max-width:60%}
+.cand{display:flex;flex-direction:column;align-items:flex-start;gap:1px;
+      background:rgba(255,255,255,.94);border:1px solid var(--line);border-radius:7px;
+      padding:4px 9px;cursor:pointer;font:inherit;box-shadow:0 1px 4px rgba(0,0,0,.07)}
+.cand b{font-size:11.5px;font-weight:650}
+.cand span{font-size:10.5px;color:var(--muted);white-space:nowrap}
+.cand.on{background:var(--accent);border-color:var(--accent)}
+.cand.on b,.cand.on span{color:#fff}
+
+.stoprow{cursor:default}
+.stoprow:hover{background:#eef3ee}
+
+.swatch{display:inline-block;width:9px;height:9px;border-radius:2px;margin-right:5px;
+        vertical-align:middle}
+
+/* the floor-only preview: visible but plainly not the finished answer */
+#canvas.preview{opacity:.45;filter:grayscale(.55)}
+.previewnote{position:absolute;left:50%;top:14px;transform:translateX(-50%);z-index:6;
+             background:var(--card);border:1px solid var(--line);border-radius:8px;
+             padding:7px 14px;font-size:12.5px;box-shadow:0 2px 8px rgba(0,0,0,.09)}

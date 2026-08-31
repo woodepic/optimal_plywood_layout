@@ -16,7 +16,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from .models import LayoutParams, LayoutResult, Panel
-from .solver import solve, solve_streaming
+from .solver import build_groups, cabinet_of, solve, solve_streaming
 from .step_parser import StepParseError, assign_labels, parse_step
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -50,6 +50,7 @@ class UploadResponse(BaseModel):
 
 class PanelOverride(BaseModel):
     included: bool | None = None
+    grain_match: bool | None = None
     grain_locked: bool | None = None
     label: str | None = None
 
@@ -65,6 +66,13 @@ def _load(path: Path, source: str) -> UploadResponse:
         panels, warnings = parse_step(str(path))
     except StepParseError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    # Pre-tick the faces that look visible, so the parts table opens on a
+    # sensible selection the user can correct rather than an empty one.
+    from .grain import auto_select
+    from .solver import cabinet_of
+    for panel in panels:
+        panel.grain_match = panel.id in auto_select(panels, cabinet_of)
+
     job_id = uuid.uuid4().hex[:12]
     JOBS[job_id] = panels
     return UploadResponse(job_id=job_id, source=source, panels=panels,
@@ -121,6 +129,8 @@ def _panels_for(req: LayoutRequest) -> list[Panel]:
             continue
         if override.included is not None:
             panel.included = override.included
+        if override.grain_match is not None:
+            panel.grain_match = override.grain_match
         if override.grain_locked is not None:
             panel.grain_locked = override.grain_locked
         if override.label is not None:
@@ -154,6 +164,40 @@ def layout_stream(req: LayoutRequest):
     return StreamingResponse(frames(), media_type="application/x-ndjson",
                              headers={"Cache-Control": "no-store",
                                       "X-Accel-Buffering": "no"})
+
+
+@app.post("/api/prove")
+def prove(req: LayoutRequest):
+    """Try to prove each sheet's arrangement uses the fewest possible cuts.
+
+    Small sheets finish and yield a real proof; large ones time out and are
+    reported as unproven rather than being presented as one.
+    """
+    from .exact import prove_layout
+    from .nesting import PartSpec
+
+    panels = _panels_for(req)
+    result = solve(panels, req.params)
+    by_id = {p.id: p for p in panels}
+    cabinets = {p.id: cabinet_of(p) for p in panels}
+
+    sheet_parts, current = [], []
+    for sheet in result.sheets:
+        specs = []
+        for placement in sheet.placements:
+            panel = by_id[placement.panel_id]
+            specs.append(PartSpec(id=panel.id, label=panel.label,
+                                  w=panel.width_mm, h=panel.length_mm,
+                                  grain_locked=panel.grain_locked,
+                                  group_key=cabinets[panel.id]))
+        sheet_parts.append(specs)
+        current.append(len(sheet.cuts))
+
+    proof = prove_layout(sheet_parts, req.params.sheet_width_mm - 2 * req.params.edge_trim_mm,
+                         req.params.sheet_length_mm - 2 * req.params.edge_trim_mm,
+                         req.params.kerf_mm, current, budget=45.0)
+    proof["total_cuts"] = sum(current)
+    return proof
 
 
 @app.get("/")

@@ -25,16 +25,20 @@
       </section>
 
       <section class="panel">
+        <h2>What matters most</h2>
+        <p class="muted small">Ranked. The top one always wins; the rest break ties.</p>
+        <ol id="priorities" class="prio"></ol>
+      </section>
+
+      <section class="panel">
         <h2>Sheet &amp; blade</h2>
         <label>Sheet width <span><input type="number" id="sheetW" value="48" step="0.25"> in</span></label>
         <label>Sheet length <span><input type="number" id="sheetL" value="96" step="0.25"> in</span></label>
         <label>Kerf (blade) <span><input type="number" id="kerf" value="0.087" step="0.001"> in</span></label>
         <label>Edge trim <span><input type="number" id="trim" value="0" step="0.0625"> in</span></label>
-        <label>Goal <span><select id="mode">
-            <option value="material" selected>Least plywood</option>
-            <option value="cuts">Fewest cuts</option>
-            <option value="cabinets">Group cabinets</option>
-          </select></span></label>
+        <label title="Offcuts narrower than this are treated as waste. 0 keeps every sliver, however thin.">Min offcut <span><input type="number" id="minOff" value="0" step="0.0625" min="0"> in</span></label>
+        <label>Max sheets <span><input type="number" id="maxSheets" min="1" step="1"
+            style="width:64px"> <small id="sheetFloor" class="muted"></small></span></label>
         <label>Effort <span><select id="effort">
             <option value="fast">Fast (2s)</option>
             <option value="normal">Normal (15s)</option>
@@ -45,10 +49,21 @@
           </select></span></label>
         <label class="check"><input type="checkbox" id="showCuts" checked> Show cut lines</label>
         <label class="check"><input type="checkbox" id="showOutlines" checked> Show part outlines</label>
+        <label class="check"><input type="checkbox" id="grainRun">
+          Continuous grain on drawer faces</label>
         <label class="check"><input type="checkbox" id="animate" checked> Animate the search</label>
         <label class="check"><input type="checkbox" id="keepGoing" checked> Keep improving in the background</label>
         <button id="solve" class="primary" disabled>Run optimiser</button>
         <div id="stats" class="stats"></div>
+      </section>
+
+      <section class="panel">
+        <h2>Results</h2>
+        <div id="report" class="report"><p class="muted small">Run the optimiser.</p></div>
+        <button id="prove" class="ghost" disabled>Prove optimality</button>
+        <p class="muted small">Exhaustive search with pruning. Small sheets finish and
+          give a real proof; large ones will not, and say so.</p>
+        <div id="proof" class="proof"></div>
       </section>
 
       <section class="panel grow">
@@ -69,6 +84,10 @@
         <span id="zoomLabel">100%</span>
         <button id="zoomIn" title="Zoom in">+</button>
         <button id="fit" class="wide">Fit</button>
+        <span class="sawkey">
+          <b style="--c:#1f8a4c"></b>mitre
+          <b style="--c:#c0392b"></b>track saw
+        </span>
         <span class="hint">scroll to zoom · drag to pan</span>
       </div>
       <div id="empty" class="empty">
@@ -79,6 +98,11 @@
         </div>
       </div>
       <svg id="canvas" hidden></svg>
+
+      <div id="candidates" class="candidates" hidden></div>
+      <div id="previewNote" class="previewnote" hidden>
+        Plywood floor only — set what matters, then <b>Run optimiser</b>.
+      </div>
 
       <div id="loading" class="loading" hidden>
         <div class="loadcard">
@@ -101,6 +125,11 @@
         <div id="cutlist" class="scroll"></div>
       </section>
       <div id="bsplit" class="splitter vertical thin" title="Drag to resize"></div>
+      <section class="pane">
+        <div class="panehead"><h2>Constant widths</h2></div>
+        <div id="stopplan" class="scroll"></div>
+      </section>
+      <div id="ssplit" class="splitter vertical thin" title="Drag to resize"></div>
       <section class="pane">
         <div class="panehead">
           <h2>Materials</h2>
