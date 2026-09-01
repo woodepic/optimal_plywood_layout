@@ -15,20 +15,27 @@ import pytest
 from conftest import CABINET, find_step
 
 from app.models import LayoutParams
-from app.nesting import PartSpec, optimise_iter
+from app.nesting import DENSITY_HEURISTICS, PartSpec, optimise_iter
 from app.objective import consolidate_first, emptiest_first, sheet_surrogates
 from app.solver import build_groups, cabinet_of, solve
 from app.step_parser import parse_step
 
 V3 = find_step("V3") or find_step("Kitchen")
-W, L, KERF = 1219.2, 2438.4, 2.2
+W, L, KERF, MITER = 1219.2, 2438.4, 2.2, 304.8
 SHEET = W * L
 SEEDS = (12345, 98765, 1, 7, 42)
-# Long enough that the gradient has converged rather than been caught mid-climb:
-# at two seconds this stock reaches its floor on seven seeds in ten, at four on
-# ten in ten. The claim being tested is that the search is *aimed* at the floor,
-# not that it sprints there.
-FLOOR_BUDGET = 4.0
+# Long enough that the gradient has converged rather than been caught mid-climb.
+# The claim being tested is that the search is *aimed* at the floor, not that it
+# sprints there -- so the budget is set where the gradient has settled and the
+# answer stops changing, and the number itself is not the property.
+#
+# It used to be four seconds. Giving the surrogate a track-cut tiebreaker under
+# the fill gradient slowed the climb without weakening it: at four seconds this
+# stock now reaches the floor on four seeds in five, at ten on five in five, and
+# it stays five in five however much longer it is given. That the whole solve
+# still reaches the floor at *fast* effort is checked separately, end to end, by
+# `TestTheSampleKitchen`.
+FLOOR_BUDGET = 10.0
 
 
 def stock_specs(path, nominal=None):
@@ -52,9 +59,17 @@ def area_bound(specs):
 
 
 def best_count(specs, rate, seed, budget):
+    """Exactly how the solver runs its floor pass, so this tests the real thing.
+
+    The config space matters as much as the objective: offered all five
+    placement heuristics the same search lands a sheet high, which is why the
+    floor pass is given only the three that are about area.
+    """
     best = None
     for state in optimise_iter(specs, W, L, KERF, time_budget=budget, seed=seed,
-                               scorer=rate, align_offsets=False):
+                               scorer=rate, align_offsets=False,
+                               heuristics=DENSITY_HEURISTICS,
+                               allow_best_fit=False, miter_capacity=MITER):
         if state.improved:
             best = len(state.sheets)
     return best

@@ -77,7 +77,21 @@ recognizable.
   settings. Parts are grouped into *families* by the dimension they share with
   the most other parts; families seed the search, whole families move as a block
   during it, and a placement heuristic prefers free rectangles whose cuts land on
-  a measurement that sheet has already been set to — or need no cut at all.
+  a measurement that sheet has already been set to — or need no cut at all. None
+  of that runs during the floor pass: gathering parts that measure alike is a
+  fine instinct for the saw and a poor one for density, and it was costing a
+  sheet.
+- **Placement decides which saw a cut lands on.** Seating a part takes a cut to
+  width and a cut to length, and how far each has to reach — and so which saw
+  makes it — depends on which comes first and how the part is turned. The `CHOP`
+  heuristic scores a seat by exactly that: how many *track* cuts it adds. Nothing
+  else in the packer has any reason to care.
+- **Two ways to choose the sheet, because they are good at opposite things.**
+  First fit takes the first sheet that will have the part, which fills sheets
+  before opening the next and is what drives the count down. Best fit asks every
+  open sheet and takes the best seat going, which spreads the parts — it costs a
+  sheet on a tight job, so it is only offered when the ceiling is above the area
+  floor, and the ranked score rejects it the moment it needs an extra sheet.
 - **It keeps improving in the background.** Once the first answer is on screen the
   search carries on, and the layout is quietly replaced whenever something better
   turns up. The app stays fully usable throughout. Uncheck *Keep improving in the
@@ -119,7 +133,9 @@ Two are used, because neither dominates:
 
 - **Emptiest sheet.** A sheet disappears when its parts fit elsewhere, so keep
   making the least full sheet emptier still. Every move that shifts work off it
-  is rewarded, right up to the moment it empties and the count drops.
+  is rewarded, right up to the moment it empties and the count drops. Read to the
+  nearest twentieth of a sheet, because a raw fill fraction never ties and a term
+  that never ties makes everything under it dead weight.
 - **Largest offcut.** Gather the waste into one rectangle rather than scattering
   it. Weaker on big jobs — a tidy layout is precisely what cannot shed a sheet —
   but it wins on small ones, where there are only two sheets and consolidating
@@ -131,6 +147,24 @@ by a whole sheet: on the sample kitchen's 151-part half-inch stock, emptiest-she
 reaches the floor from every seed tried in under four seconds, while largest-offcut
 alone reached it on one run in ten and looked, from any single run, like the floor
 simply was not there.
+
+**Underneath both sits the track-cut count, and it matters more than a tiebreak
+usually does.** Many layouts use the same number of sheets and leave the same
+sheet equally empty. They are not equally good to cut, and the search has to
+settle on one of them for the ranked stages to start from. Left to pick
+arbitrarily it lands on layouts needing 25 more track cuts than they had to --
+and the ranked stages cannot undo it. At the sheet floor the sheets are 92% full,
+so almost nothing can move: of 20,000 legal moves measured at the floor, *not one*
+reduced the track-cut count. Whatever structure the floor pass hands over is the
+structure you get, so the choice is made there, on the one criterion that is cheap
+to measure and tells sane structure from a jumble.
+
+For the same reason the floor pass is given only the three classic area fits.
+`STOP` and `CHOP` each trade area for something it has no use for yet, and
+offering them there costs both the sheet and the structure -- on that same stock,
+the search that lands on 12 sheets and 138 track cuts with three heuristics lands
+on 196 with all five. They earn their place in the ranked stages, where the thing
+they optimise is the objective.
 
 That last point is why `tests/test_sheets.py` checks the floor is reached **from
 every seed** rather than from the default one. A search that only wins on one
@@ -201,11 +235,22 @@ measure six different widths needs six settings however you sequence it. That is
 what the shared-dimension seeds and moves below are for.
 
 The two goals pull against each other, and the cap is where you decide between
-them. On the sample kitchen the floor is 16 sheets and that layout takes about 114
-stop changes; allow it a 17th and the same job settles around 93, because a looser
-pack can afford to put like widths together. Sheets first is the default because
-plywood costs money, but raising **Max sheets** by one is a real option and the
-report shows you both ends of the trade.
+them. On the sample kitchen:
+
+| Max sheets | sheets | track cuts | stop changes | saw changes |
+|---|---|---|---|---|
+| floor (default) | 16 | ~195 | ~115 | ~20 |
+| floor + 1 | 17 | ~163 | ~95 | ~19 |
+
+The 16-sheet pack is 92% full on its half-inch stock, and a sheet that full has to
+nest parts inside each other: every crosscut then spans something wide, which
+means the track saw. Give it one more sheet and the same parts fall into narrow
+strips whose crosscuts are bench chops — about 30 fewer track-saw setups and 20
+fewer stop moves, for one sheet of plywood.
+
+Sheets first is the default because plywood costs money and the cut order does
+not. But this really is a trade, not a bug, and **Max sheets** is the dial: set it
+to the floor plus one and the saw work drops sharply.
 
 ### The identity behind the cut counts
 
@@ -308,7 +353,7 @@ tests/
 .venv/bin/python -m pytest tests/ -q
 ```
 
-203 tests covering kerf arithmetic, the guillotine invariants, instance-name
+204 tests covering kerf arithmetic, the guillotine invariants, instance-name
 normalisation, the streaming search, every ranked criterion, the separating-cut
 metric, background refinement, and the HTTP API. Hard expectations against
 the real cabinet: 21 panels, three distinct drawers, no collapsed duplicate names,

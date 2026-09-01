@@ -14,14 +14,29 @@ from math import ceil
 from typing import NamedTuple
 
 EPS = 1e-6
-# How to choose which free rectangle a part goes in. The first three are the
-# classic area/short-side/long-side fits. "STOP" is ours: among the rectangles a
-# part fits in, prefer the one whose cuts land on a measurement this sheet has
-# already been set to -- or need no cut at all. Every cut offset is a part
-# dimension, so that is the difference between a sheet needing two stop settings
-# and needing six.
-HEURISTICS = ("BAF", "BSSF", "BLSF", "STOP")
+# How to choose which free rectangle a part goes in, and which way round. The
+# first three are the classic area/short-side/long-side fits. The other two are
+# ours, and each is aimed at one of the ranked criteria:
+#
+#   "STOP"  prefer cuts that land on a measurement this sheet has already been
+#           set to, or need no cut at all. Every cut offset is a part dimension,
+#           so this is the difference between a sheet needing two stop settings
+#           and needing six.
+#   "CHOP"  prefer cuts the miter saw can reach. Which saw makes a cut is
+#           decided by how far it has to reach, and reach is decided by how the
+#           part is turned -- so this is the difference between chopping a part
+#           at the bench and wrestling the track saw across it.
+HEURISTICS = ("BAF", "BSSF", "BLSF", "STOP", "CHOP")
+# The three classic fits, for the pass that is only trying to shed a sheet.
+# "STOP" and "CHOP" each trade area for something the floor pass has no use for
+# yet, and offering them there measurably costs both density and structure: on
+# the sample kitchen's tight stock the same search that lands on 12 sheets and
+# 138 track cuts with these three lands on 196 with all five. They earn their
+# place in the ranked stages, which is where the thing they optimise is the
+# objective.
+DENSITY_HEURISTICS = ("BAF", "BSSF", "BLSF")
 STOP_ROUND = 1        # mm; offsets this close are one setting, as in app.schedule
+DEFAULT_MITER = 304.8 # 12"; a common sliding miter saw
 
 # Objective modes.
 MODE_MATERIAL = "material"
@@ -76,10 +91,15 @@ class PartSpec:
 
 class SheetLayout:
     def __init__(self, width: float, length: float, kerf: float,
-                 min_offcut: float = 0.0):
+                 min_offcut: float = 0.0,
+                 miter_capacity: float = DEFAULT_MITER):
         self.width = width
         self.length = length
         self.kerf = kerf
+        # How far the chop saw reaches. The packer needs it because *placement*
+        # decides which saw a cut lands on: turn a 9" x 30" part the other way
+        # and its crosscut goes from a bench chop to a track-saw setup.
+        self.miter_capacity = miter_capacity
         # Anything narrower than this is treated as waste rather than a usable
         # offcut. Default 0: keep every sliver, however thin. A remainder smaller
         # than the kerf still cannot survive -- the blade consumes that material.
@@ -105,7 +125,8 @@ class SheetLayout:
         free and desirable, but the search holds these layouts and compares them
         against scores taken earlier, so composing an answer works on a copy.
         """
-        clone = SheetLayout(self.width, self.length, self.kerf, self.min_offcut)
+        clone = SheetLayout(self.width, self.length, self.kerf, self.min_offcut,
+                            self.miter_capacity)
         clone.pieces = {pid: replace(pc, children=list(pc.children),
                                      cut=(None if pc.cut is None
                                           else replace(pc.cut)))
@@ -162,24 +183,52 @@ class SheetLayout:
 
     # -- placement -------------------------------------------------------
 
-    def _fit_score(self, pc: Piece, w: float, h: float, heuristic: str):
+    def _fit_score(self, pc: Piece, w: float, h: float, heuristic: str,
+                   vertical_first: bool = True):
         if heuristic == "BAF":
             return pc.area - w * h
         if heuristic == "BSSF":
             return min(pc.w - w, pc.h - h)
         if heuristic == "BLSF":
             return max(pc.w - w, pc.h - h)
-        # STOP: reuse a setting the saw is already at, and prize a dimension
-        # that needs no cut at all, before worrying about wasted area.
-        credit = 0
-        for extent, size in ((pc.w, w), (pc.h, h)):
-            if extent - size <= EPS:
-                credit += 2                     # exact fit: no cut, no setting
-            elif round(size, STOP_ROUND) in self.stops:
-                credit += 1
-        return (-credit, pc.area - w * h)
+        if heuristic == "STOP":
+            # Reuse a setting the saw is already at, and prize a dimension that
+            # needs no cut at all, before worrying about wasted area.
+            credit = 0
+            for extent, size in ((pc.w, w), (pc.h, h)):
+                if extent - size <= EPS:
+                    credit += 2                 # exact fit: no cut, no setting
+                elif round(size, STOP_ROUND) in self.stops:
+                    credit += 1
+            return (-credit, pc.area - w * h)
 
-    def try_place(self, part: PartSpec, heuristic: str, vertical_first: bool) -> bool:
+        # CHOP: seat the part so its cuts land on the miter saw.
+        #
+        # Scored by what it actually costs rank 2 -- the number of *track* cuts
+        # this placement adds, which is between zero and two and is entirely
+        # decided here. Seating a part takes a cut to width and a cut to length;
+        # either is skipped if the rectangle already fits that way, and either
+        # goes to the chop saw if it does not have to reach further than the saw
+        # does. How far it has to reach depends on which cut comes first and how
+        # the part is turned, and nothing else in the packer has any reason to
+        # care -- so on the sample kitchen 22 parts that could have been chopped
+        # were being wrestled with the track saw instead.
+        cap = self.miter_capacity + EPS
+        if vertical_first:
+            cuts = ((pc.w - w > EPS, pc.h),      # rip to width, spans the height
+                    (pc.h - h > EPS, w))         # then crosscut, spans the width
+        else:
+            cuts = ((pc.h - h > EPS, pc.w),      # crosscut first, spans the width
+                    (pc.w - w > EPS, h))         # then rip, spans the length
+        cost = sum(1 for needed, span in cuts if needed and span > cap)
+        return (cost, pc.area - w * h)
+
+    def offer(self, part: PartSpec, heuristic: str, vertical_first: bool):
+        """The best seat this sheet has for the part, or None. Changes nothing.
+
+        Split out from `try_place` so a caller can ask every sheet what it would
+        do before committing to one -- see `pack`'s `best_fit`.
+        """
         options = [(part.w, part.h, False)]
         if not part.grain_locked and abs(part.w - part.h) > EPS:
             options.append((part.h, part.w, True))
@@ -189,9 +238,13 @@ class SheetLayout:
             pc = self.pieces[pid]
             for w, h, rotated in options:
                 if w <= pc.w + EPS and h <= pc.h + EPS:
-                    s = self._fit_score(pc, w, h, heuristic)
+                    s = self._fit_score(pc, w, h, heuristic, vertical_first)
                     if best is None or s < best[0]:
                         best = (s, pid, w, h, rotated)
+        return best
+
+    def try_place(self, part: PartSpec, heuristic: str, vertical_first: bool) -> bool:
+        best = self.offer(part, heuristic, vertical_first)
         if best is None:
             return False
 
@@ -268,12 +321,41 @@ def separating_cuts(sheet: SheetLayout, cabinets: dict[str, str]) -> int:
 
 
 def pack(parts: list[PartSpec], width: float, length: float, kerf: float,
-         heuristic: str, vertical_first: bool, min_offcut: float = 0.0) -> list[SheetLayout] | None:
-    """First-fit the parts across as many sheets as needed. None if a part cannot fit."""
+         heuristic: str, vertical_first: bool, min_offcut: float = 0.0,
+         miter_capacity: float = DEFAULT_MITER,
+         best_fit: bool = False) -> list[SheetLayout] | None:
+    """Fit the parts across as many sheets as needed. None if a part cannot fit.
+
+    Two ways to choose the sheet, and they are good at opposite things, so both
+    are in the search's config space rather than one being picked as the winner:
+
+    *First fit* takes the first sheet that will have the part. That fills sheets
+    before opening the next, which is what drives the count down -- and the sheet
+    count is priority one.
+
+    *Best fit* asks every open sheet what it would do and takes the best seat
+    going. That spreads the parts, which costs a sheet on a tight job, but on a
+    job with a sheet to spare it seats more parts where the chop saw can reach
+    them. The ranked score decides: the sheet ceiling is the first term, so a
+    best-fit layout that needs an extra sheet is rejected before its cut counts
+    are even looked at.
+    """
     sheets: list[SheetLayout] = []
     for part in parts:
-        if not any(s.try_place(part, heuristic, vertical_first) for s in sheets):
-            fresh = SheetLayout(width, length, kerf, min_offcut)
+        seated = False
+        if best_fit:
+            pick = None
+            for index, sheet in enumerate(sheets):
+                got = sheet.offer(part, heuristic, vertical_first)
+                if got is not None and (pick is None or got[0] < pick[0]):
+                    pick = (got[0], index)
+            seated = (pick is not None
+                      and sheets[pick[1]].try_place(part, heuristic, vertical_first))
+        else:
+            seated = any(s.try_place(part, heuristic, vertical_first)
+                         for s in sheets)
+        if not seated:
+            fresh = SheetLayout(width, length, kerf, min_offcut, miter_capacity)
             if not fresh.try_place(part, heuristic, vertical_first):
                 return None
             sheets.append(fresh)
@@ -440,9 +522,10 @@ def _perturb_grouped(order: list[PartSpec], rng: random.Random) -> list[PartSpec
 
 def pack_one(parts: list[PartSpec], width: float, length: float, kerf: float,
              heuristic: str, vertical_first: bool,
-             min_offcut: float = 0.0) -> SheetLayout | None:
+             min_offcut: float = 0.0,
+             miter_capacity: float = DEFAULT_MITER) -> SheetLayout | None:
     """Pack these parts onto exactly one sheet, or None if they do not all fit."""
-    layout = SheetLayout(width, length, kerf, min_offcut)
+    layout = SheetLayout(width, length, kerf, min_offcut, miter_capacity)
     for part in parts:
         if not layout.try_place(part, heuristic, vertical_first):
             return None
@@ -457,7 +540,8 @@ def _buckets_from(sheets: list[SheetLayout],
 
 def dissolve(buckets: list[list[PartSpec]], victim: int, width: float,
              length: float, kerf: float, heuristic: str, vertical_first: bool,
-             min_offcut: float = 0.0) -> list[list[PartSpec]] | None:
+             min_offcut: float = 0.0,
+             miter_capacity: float = DEFAULT_MITER) -> list[list[PartSpec]] | None:
     """Empty one sheet onto the others. None if its parts will not all fit.
 
     This is the move nothing else can make. Reordering cannot carry a part to a
@@ -477,7 +561,7 @@ def dissolve(buckets: list[list[PartSpec]], victim: int, width: float,
     layouts = []
     for bucket in survivors:
         layout = pack_one(bucket, width, length, kerf, heuristic,
-                          vertical_first, min_offcut)
+                          vertical_first, min_offcut, miter_capacity)
         if layout is None:
             return None
         layouts.append(layout)
@@ -601,7 +685,8 @@ def _gather(buckets: list[list[PartSpec]],
 
 
 def optimise_assign(buckets, width, length, kerf, heuristic, vertical_first,
-                    min_offcut: float = 0.0):
+                    min_offcut: float = 0.0,
+                    miter_capacity: float = DEFAULT_MITER):
     """Realise an assignment, or None if any sheet's parts do not fit.
 
     The search itself goes through `optimise_iter`'s own depot, which keeps one
@@ -612,7 +697,7 @@ def optimise_assign(buckets, width, length, kerf, heuristic, vertical_first,
     sheets = []
     for bucket in buckets:
         layout = pack_one(bucket, width, length, kerf, heuristic, vertical_first,
-                          min_offcut)
+                          min_offcut, miter_capacity)
         if layout is None:
             return None
         sheets.append(layout)
@@ -691,7 +776,10 @@ def optimise_iter(parts: list[PartSpec], width: float, length: float, kerf: floa
                   warm_start: list[PartSpec] | None = None,
                   cabinets: dict[str, str] | None = None,
                   scorer=None, group_aware: bool | None = None,
-                  min_offcut: float = 0.0, align_offsets: bool = False):
+                  min_offcut: float = 0.0, align_offsets: bool = False,
+                  heuristics: tuple[str, ...] | None = None,
+                  miter_capacity: float = DEFAULT_MITER,
+                  allow_best_fit: bool = False):
     """Search for the best guillotine layout, reporting progress as it goes.
 
     Deterministic size-ordered seeds first, then **iterated local search**: keep
@@ -715,20 +803,22 @@ def optimise_iter(parts: list[PartSpec], width: float, length: float, kerf: floa
     best: list[SheetLayout] | None = None
     best_score: tuple | None = None
     best_order: list[PartSpec] | None = None
-    best_config: tuple[str, bool] = (HEURISTICS[0], True)
+    choices = heuristics or HEURISTICS
+    best_config: tuple[str, bool, bool] = (choices[0], True, False)
     attempts = 0
 
-    def consider(order, heuristic, vertical_first) -> bool:
+    def consider(order, heuristic, vertical_first, best_fit=False) -> bool:
         nonlocal best, best_score, best_order, best_config, attempts
         attempts += 1
         result = pack(order, width, length, kerf, heuristic, vertical_first,
-                      min_offcut)
+                      min_offcut, miter_capacity, best_fit)
         if result is None:
             return False
         s = rate(result)
         if best_score is None or s < best_score:
             best, best_score = result, s
-            best_order, best_config = order[:], (heuristic, vertical_first)
+            best_order = order[:]
+            best_config = (heuristic, vertical_first, best_fit)
             return True
         return False
 
@@ -740,11 +830,18 @@ def optimise_iter(parts: list[PartSpec], width: float, length: float, kerf: floa
         seeds = _grouped_orders(parts) + seeds
     if warm_start:
         seeds.insert(0, list(warm_start))   # continue from a previous run's best
+    # Best fit is only worth a look when there is a sheet to spare: it seats
+    # more parts where the chop saw can reach them, at the price of spreading
+    # them over one more sheet. With the ceiling already at the floor it cannot
+    # win, and offering it doubles the configurations the search has to sift.
+    fits = (False, True) if allow_best_fit else (False,)
     for order in seeds:
-        for heuristic in HEURISTICS:
+        for heuristic in choices:
             for vertical_first in (True, False):
-                if consider(order, heuristic, vertical_first):
-                    yield SearchState(best, best_score, attempts, True, best_order)
+                for best_fit in fits:
+                    if consider(order, heuristic, vertical_first, best_fit):
+                        yield SearchState(best, best_score, attempts, True,
+                                          best_order)
 
     if best is None or best_order is None:
         return
@@ -769,14 +866,14 @@ def optimise_iter(parts: list[PartSpec], width: float, length: float, kerf: floa
     # as well. Nothing mutates a layout once packed, so sharing is safe.
     depot: dict[tuple, SheetLayout] = {}
 
-    def realise(assignment, heuristic, vertical_first):
+    def realise(assignment, heuristic, vertical_first, best_fit=False):
         sheets = []
         for bucket in assignment:
             key = (heuristic, vertical_first, tuple(p.id for p in bucket))
             layout = depot.get(key)
             if layout is None:
                 layout = pack_one(bucket, width, length, kerf, heuristic,
-                                  vertical_first, min_offcut)
+                                  vertical_first, min_offcut, miter_capacity)
                 if layout is None:
                     return None
                 if len(depot) > 8000:
@@ -797,9 +894,11 @@ def optimise_iter(parts: list[PartSpec], width: float, length: float, kerf: floa
 
     while time.perf_counter() < deadline:
         if rng.random() < 0.8:
-            heuristic, vertical_first = best_config
+            heuristic, vertical_first, best_fit = best_config
         else:
-            heuristic, vertical_first = rng.choice(HEURISTICS), rng.random() < 0.5
+            heuristic = rng.choice(choices)
+            vertical_first = rng.random() < 0.5
+            best_fit = allow_best_fit and rng.random() < 0.3
 
         # Alternate between reshuffling the global ordering (which can collapse
         # sheet count) and moving individual parts between sheets (which is the
@@ -813,13 +912,14 @@ def optimise_iter(parts: list[PartSpec], width: float, length: float, kerf: floa
             victim = (min(range(len(buckets)), key=lambda k: len(buckets[k]))
                       if rng.random() < 0.5 else rng.randrange(len(buckets)))
             candidate = dissolve(buckets, victim, width, length, kerf,
-                                 heuristic, vertical_first, min_offcut)
+                                 heuristic, vertical_first, min_offcut,
+                                 miter_capacity)
             if candidate is None:
                 stale += 1
                 continue
             sheets = realise(candidate, heuristic, vertical_first)
             improved = consider_sheets(sheets, [p for b in candidate for p in b],
-                                       (heuristic, vertical_first))
+                                       (heuristic, vertical_first, False))
             if improved:
                 buckets = candidate
         elif rng.random() < assign_share:
@@ -829,7 +929,7 @@ def optimise_iter(parts: list[PartSpec], width: float, length: float, kerf: floa
                 continue
             sheets = realise(candidate, heuristic, vertical_first)
             improved = consider_sheets(sheets, [p for b in candidate for p in b],
-                                       (heuristic, vertical_first))
+                                       (heuristic, vertical_first, False))
             if improved:
                 buckets = candidate
         else:
@@ -844,7 +944,7 @@ def optimise_iter(parts: list[PartSpec], width: float, length: float, kerf: floa
                              else _perturb_align(current, rng))
             else:
                 candidate = _perturb(current, rng)
-            improved = consider(candidate, heuristic, vertical_first)
+            improved = consider(candidate, heuristic, vertical_first, best_fit)
             if improved:
                 current = candidate
                 buckets = _buckets_from(best, by_id)

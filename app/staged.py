@@ -145,7 +145,8 @@ def plan(parts: list[PartSpec], sheet_w: float, sheet_l: float, kerf: float,
 
 
 def build(sheets: list[list[Strip]], sheet_w: float, sheet_l: float,
-          kerf: float, min_offcut: float = 0.0) -> list[SheetLayout]:
+          kerf: float, min_offcut: float = 0.0,
+          miter_capacity: float | None = None) -> list[SheetLayout]:
     """Turn a strip plan into real guillotine layouts.
 
     Cuts are driven directly rather than going through the free-rectangle
@@ -154,7 +155,8 @@ def build(sheets: list[list[Strip]], sheet_w: float, sheet_l: float,
     """
     layouts: list[SheetLayout] = []
     for plan_sheet in sheets:
-        layout = SheetLayout(sheet_w, sheet_l, kerf, min_offcut)
+        layout = SheetLayout(sheet_w, sheet_l, kerf, min_offcut,
+                             miter_capacity if miter_capacity else 304.8)
         remaining = 0                      # piece still to be ripped
         layout.free.clear()
 
@@ -199,7 +201,7 @@ def pack_staged(parts: list[PartSpec], sheet_w: float, sheet_l: float, kerf: flo
     plan_sheets = plan(parts, sheet_w, sheet_l, kerf, choices, miter_capacity)
     if plan_sheets is None:
         return None
-    return build(plan_sheets, sheet_w, sheet_l, kerf, min_offcut)
+    return build(plan_sheets, sheet_w, sheet_l, kerf, min_offcut, miter_capacity)
 
 
 def search_staged_iter(parts: list[PartSpec], sheet_w: float, sheet_l: float,

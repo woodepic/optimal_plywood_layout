@@ -29,7 +29,7 @@ from .geometry import cluster_thicknesses
 from .models import (CriterionReport, LayoutAlternative, LayoutParams,
                      LayoutResult, Panel, Placement, Sheet, StopRun,
                      ThicknessGroup)
-from .nesting import PartSpec, SheetLayout, optimise_iter
+from .nesting import (DENSITY_HEURISTICS, PartSpec, SheetLayout, optimise_iter)
 from .grain import build_runs, expand_all, substitute
 from .staged import search_staged_iter
 from .objective import (GROUPING, LABELS, STAGED, STOPCHANGES, measure,
@@ -378,7 +378,8 @@ def solve_streaming(panels: list[Panel], params: LayoutParams,
 
     # Both gradients toward one sheet fewer; see app/objective.py for why there
     # are two and why the choice matters more than the time spent.
-    SURROGATES = sheet_surrogates(params.sheet_width_mm * params.sheet_length_mm)
+    SURROGATES = sheet_surrogates(params.sheet_width_mm * params.sheet_length_mm,
+                                  params.miter_capacity_mm)
 
     def neighbours(task: Task) -> tuple[list[SheetLayout], list[SheetLayout]]:
         """The other stocks' sheets, in job order, either side of this one.
@@ -445,8 +446,15 @@ def solve_streaming(panels: list[Panel], params: LayoutParams,
         return measure(layouts, cabinet_arg, params.miter_capacity_mm)
 
     def run_task(task: Task, budget: float, seed: int, pass_no: int, warm=None,
-                 rate=None, stage: str | None = None):
-        """Search one task, streaming frames. Keeps the result only if better."""
+                 rate=None, stage: str | None = None, patient: bool = False):
+        """Search one task, streaming frames. Keeps the result only if better.
+
+        `patient` spends the whole budget instead of handing it back when the
+        search goes quiet. The floor pass sets it: plywood is priority one, its
+        budget is already capped, and a stall is not evidence that no tighter
+        pack exists -- it is what a hill climb looks like just before it finds
+        one. Starving it cost a sheet on a sixteen-part job.
+        """
         nonlocal last_frame
         # Both capped rather than pure fractions of the budget: at two minutes a
         # plain fraction means sitting silent for half a minute after the last
@@ -458,8 +466,9 @@ def solve_streaming(panels: list[Panel], params: LayoutParams,
         # a twenty-one-part cabinet sat out a fixed stall in every stage of every
         # sweep and spent two minutes finishing work it had done in the first
         # second.
-        hard_stall = min(max(0.5, budget * 0.35), 12.0,
-                         max(0.5, 0.05 * len(task.specs)))
+        hard_stall = (float("inf") if patient
+                      else min(max(0.5, budget * 0.35), 12.0,
+                               max(0.5, 0.05 * len(task.specs))))
 
         caps[task.id] = cap_for(task)
 
@@ -476,7 +485,11 @@ def solve_streaming(panels: list[Panel], params: LayoutParams,
         # or rip widths are ranked highly -- a store's panel saw will do long
         # rips for free but nothing else -- and loses on sheet count, which is
         # exactly the trade the ranking is supposed to decide.
-        rip_share = 0.6 if order[0] in (STAGED, STOPCHANGES) else 0.15
+        # A rip-first layout wins on saw work and loses on sheet count, so it
+        # has no business spending the floor pass's budget -- that pass is
+        # looking for the tightest pack there is.
+        rip_share = (0.05 if stage is None and patient
+                     else (0.6 if order[0] in (STAGED, STOPCHANGES) else 0.15))
         rip_layouts = rip_score = None
         rip_attempts = 0
         # The rip search decides one thing per part -- which of its two
@@ -539,12 +552,31 @@ def solve_streaming(panels: list[Panel], params: LayoutParams,
                               "budget": round(total_budget, 2), "pass": pass_no}}
         budget = max(0.3, budget * (1.0 - rip_share))
 
+        # Only let the packer spread parts for the chop saw's benefit when the
+        # ceiling is above the area floor -- that is, when there is a sheet to
+        # spare. At the floor it cannot help and only dilutes the search.
+        ceiling_now = (caps.get(task.id)
+                       or sheet_floors.get(task.id, task.area_bound))
         for state in optimise_iter(task.specs, usable_w, usable_l, params.kerf_mm,
                                    time_budget=budget, seed=seed, heartbeat=0.1,
                                    warm_start=warm, cabinets=cabinet_arg,
                                    scorer=rate, group_aware=group_aware,
                                    min_offcut=params.min_offcut_mm,
-                                   align_offsets=align_offsets):
+                                   # The floor pass is looking for the tightest
+                                   # pack there is; gathering parts that measure
+                                   # alike is a fine instinct for the saw and a
+                                   # poor one for density, and it was costing a
+                                   # sheet on small jobs.
+                                   align_offsets=align_offsets and not patient,
+                                   miter_capacity=params.miter_capacity_mm,
+                                   # The floor pass wants density and nothing
+                                   # else, so it gets the three classic fits.
+                                   # The other two each trade area for something
+                                   # it has no use for yet, and offering them
+                                   # here cost both the sheet and the structure.
+                                   heuristics=(DENSITY_HEURISTICS if patient
+                                               else None),
+                                   allow_best_fit=ceiling_now > task.area_bound):
             if state.improved:
                 best_layouts, best_score, best_order = state.sheets, state.score, state.order
                 dirty = True
@@ -646,13 +678,29 @@ def solve_streaming(panels: list[Panel], params: LayoutParams,
     # harder, because the floor it finds becomes the cap everything else is
     # held to. Six seconds is not enough on a 200-part job -- it settles a
     # sheet high.
+    # Plywood is priority one and the only figure a later pass cannot recover,
+    # so the floor pass gets an absolute minimum as well as a share -- reaching
+    # the area bound on the sample kitchen's biggest stock takes about a second,
+    # and a share of a two-second budget is not a second. It is a ceiling, not a
+    # duration: the loop below stops the moment a stock is at its area bound,
+    # because nothing can beat that, and hands the rest back to the ranked
+    # stages.
     floor_budget = (min(total_budget * 0.22, 6.0) if params.floor_only
-                    else min(total_budget * 0.35, 30.0))
+                    else min(max(total_budget * 0.35, 3.0), 30.0))
     for task in tasks:
         share = floor_budget * weights[task.id] / max(sum(weights.values()), 1)
+        began = time.perf_counter()
         for n, rate in enumerate(SURROGATES):
-            yield from run_task(task, share / len(SURROGATES),
-                                FIRST_PASS_SEED + n * 13, 1, rate=rate)
+            if task.id in results and len(results[task.id][0]) <= task.area_bound:
+                break     # at the area bound: no layout can beat this, so stop
+            left = share - (time.perf_counter() - began)
+            if left <= 0:
+                break
+            # The first gradient gets the larger slice because it is the one
+            # that usually gets there; the second only runs if it did not.
+            slice_now = left * 0.65 if n < len(SURROGATES) - 1 else left
+            yield from run_task(task, slice_now, FIRST_PASS_SEED + n * 13, 1,
+                                rate=rate, patient=True)
         # `run_task` only stores a layout that beats what it already had, and
         # sheet count leads both surrogates, so this is the better of the two.
         sheet_floors[task.id] = (len(results[task.id][0]) if task.id in results

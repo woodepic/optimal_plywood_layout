@@ -175,25 +175,51 @@ def biggest_offcut(sheets: list[SheetLayout]) -> float:
     return biggest
 
 
-def emptiest_first(sheet_area: float):
-    """Sheet count, then how empty the least-full sheet is. Lower is better.
+# The emptiest-sheet gradient is read to the nearest twentieth of a sheet. Left
+# raw it is a continuous number that essentially never ties, which makes every
+# term under it dead weight -- and the term under it is the one that decides
+# whether the layout is any good to cut. Rounding buys the tiebreaker room to
+# work without blunting the gradient: a fifth of a sheet is far more fill than
+# any single move shifts.
+FILL_BUCKET = 0.05
+
+
+def emptiest_first(sheet_area: float,
+                   miter_capacity: float = DEFAULT_MITER_MM):
+    """Sheet count, then how empty the least-full sheet is, then track cuts.
 
     Sheet count on its own is a hopeless thing to search on: nearly every
-    candidate ties with the incumbent, so the search cannot tell which of them is
-    *closer* to needing one sheet fewer. The tiebreaker is the whole gradient,
-    and which one it is decides whether the floor gets found at all.
+    candidate ties with the incumbent, so the count cannot tell the search which
+    of them is *closer* to needing one sheet fewer. What sits under it is the
+    whole gradient.
 
     A sheet disappears when its parts fit elsewhere, so the way to lose one is to
     keep making the least full sheet emptier still: every move that shifts work
     off it is rewarded, right up to the moment it empties and the count drops.
 
+    Track cuts break the remaining ties, and that matters more than it sounds.
+    Many different layouts use the same number of sheets and leave the same sheet
+    equally empty; they are *not* equally good to cut, and the search has to
+    settle at one of them for the ranked stages to start from. Left to pick
+    arbitrarily it lands on layouts needing 25 more track cuts than it had to --
+    the ranked stages cannot undo that, because at the sheet floor there is no
+    room left to move a part and every escape route from the basin costs a sheet.
+    So the choice is made here, on the one criterion that is cheap to measure and
+    tells sane structure from a jumble: a part seated so its crosscut fits the
+    chop saw, rather than wrestled with the track saw.
+
     With a single sheet there is nothing to shed and nowhere to shed it to, so
-    the term is switched off rather than left arguing for a half-empty sheet.
+    the fill term is switched off rather than left arguing for a half-empty
+    sheet.
     """
     def rate(sheets: list[SheetLayout]) -> tuple:
-        emptiest = (min(s.used_area() for s in sheets) / sheet_area
-                    if len(sheets) > 1 else 0.0)
-        return (len(sheets), emptiest, -biggest_offcut(sheets))
+        if len(sheets) > 1:
+            fill = min(s.used_area() for s in sheets) / sheet_area
+            emptiest = round(fill / FILL_BUCKET) * FILL_BUCKET
+        else:
+            emptiest = 0.0
+        track = sum(cut_workload(s, miter_capacity)[1] for s in sheets)
+        return (len(sheets), emptiest, track)
     return rate
 
 
@@ -212,7 +238,8 @@ def consolidate_first(sheet_area: float):
     return rate
 
 
-def sheet_surrogates(sheet_area: float) -> tuple:
+def sheet_surrogates(sheet_area: float,
+                     miter_capacity: float = DEFAULT_MITER_MM) -> tuple:
     """Both gradients toward one sheet fewer.
 
     Neither dominates the other, and plywood is the one number nothing else is
@@ -220,7 +247,8 @@ def sheet_surrogates(sheet_area: float) -> tuple:
     packed tighter. Two half-length searches beat one full-length search under
     the wrong gradient by a whole sheet.
     """
-    return (emptiest_first(sheet_area), consolidate_first(sheet_area))
+    return (emptiest_first(sheet_area, miter_capacity),
+            consolidate_first(sheet_area))
 
 
 def scrap_pieces(sheet: SheetLayout) -> int:
