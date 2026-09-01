@@ -54,13 +54,30 @@ recognizable.
   found, up to four times a second, with a progress card showing which stock is
   being optimised, how many layouts have been tried, and the best result so far.
   Turn it off with *Animate the search* — the answer is identical either way.
-- **The optimiser is an iterated local search.** It perturbs the best ordering
+- **The optimiser is an iterated local search.** It perturbs the best solution
   found so far rather than reshuffling from scratch. That matters at scale: with
   100+ parts a random shuffle essentially never beats a size-sorted order, so a
   restart-only search finds everything in the first few milliseconds and then
   stalls. Effort is **Fast 2s / Normal 15s / Thorough 2 min**, and Thorough is the
   default. Those are ceilings, not durations — a task that converges hands its
   remaining time back, and a second pass re-spends it where it might still help.
+- **It searches in three spaces, because no one of them can reach everything.**
+  *Ordering* moves reshuffle the global part order and repack; only these
+  reliably collapse the sheet count. *Assignment* moves relocate individual parts
+  between existing sheets, which is the only way to bring a stray part back
+  beside the rest of its cabinet — reordering can never carry a part to a
+  different sheet. And *dissolving* empties one sheet onto the others: a layout
+  that has settled on N sheets stays on N under either of the other two, because
+  neither ever removes one. Dissolving packs for real rather than guessing —
+  every orphan is offered to each surviving sheet's live free rectangles — so it
+  either comes back with a layout known to fit or reports that the sheet cannot
+  be dissolved.
+- **Parts that measure the same are kept together.** Every cut offset is some
+  part's dimension, so a sheet holding six different dimensions needs six stop
+  settings. Parts are grouped into *families* by the dimension they share with
+  the most other parts; families seed the search, whole families move as a block
+  during it, and a placement heuristic prefers free rectangles whose cuts land on
+  a measurement that sheet has already been set to — or need no cut at all.
 - **It keeps improving in the background.** Once the first answer is on screen the
   search carries on, and the layout is quietly replaced whenever something better
   turns up. The app stays fully usable throughout. Uncheck *Keep improving in the
@@ -78,17 +95,119 @@ lexicographically: rank 1 always wins, the rest break ties.
 
 | Criterion | Meaning |
 |---|---|
-| Plywood sheets | how many sheets you buy |
-| Cuts to sort by cabinet | cuts that must happen before parts can be piled up per cabinet |
-| Total cuts | saw passes |
-| Cutting stages | how many times the cut direction changes; 2 is rips-then-crosscuts |
+| Track saw stop changes | how many times you move the stop on the parallel guide |
+| Track saw cuts | passes with the track saw — the awkward ones |
+| Saw changes | trips between the track saw and the miter saw |
+| Mitre saw cuts | passes with the chop saw — the easy ones |
 | Largest offcut | biggest single reusable piece |
+| Cuts to sort by cabinet | cuts that must happen before parts can be piled up per cabinet |
 
-Ranking *Plywood sheets* first never costs a sheet: the search first finds the
-tightest pack it can using a density-guided surrogate, then optimises whatever you
-ranked next while holding that sheet count.
+Plywood is not on the list. It is a **hard cap**, set from the proven floor unless
+you raise it, so no ranking can quietly spend a sheet. The search finds the
+tightest pack it can first, then optimises whatever you ranked while holding that
+sheet count.
 
-### The identity behind "Total cuts"
+### Finding the floor
+
+Searching on sheet count alone does not work, and the reason is worth stating
+plainly: almost every candidate layout ties with the incumbent on the count, so
+the count tells the search nothing about which candidate is *closer* to needing
+one sheet fewer. The tiebreaker underneath it is the entire gradient, and the
+choice of tiebreaker decides whether the floor is found at all — not how fast.
+
+Two are used, because neither dominates:
+
+- **Emptiest sheet.** A sheet disappears when its parts fit elsewhere, so keep
+  making the least full sheet emptier still. Every move that shifts work off it
+  is rewarded, right up to the moment it empties and the count drops.
+- **Largest offcut.** Gather the waste into one rectangle rather than scattering
+  it. Weaker on big jobs — a tidy layout is precisely what cannot shed a sheet —
+  but it wins on small ones, where there are only two sheets and consolidating
+  one of them *is* emptying the other.
+
+The opening pass runs both and keeps whichever packed tighter. Two half-length
+searches under the right gradient beat one full-length search under the wrong one
+by a whole sheet: on the sample kitchen's 151-part half-inch stock, emptiest-sheet
+reaches the floor from every seed tried in under four seconds, while largest-offcut
+alone reached it on one run in ten and looked, from any single run, like the floor
+simply was not there.
+
+That last point is why `tests/test_sheets.py` checks the floor is reached **from
+every seed** rather than from the default one. A search that only wins on one
+random seed is not a working search, and the difference is invisible until
+something unrelated — an extra placement heuristic, one more kind of move —
+consumes the random stream differently and quietly costs a sheet of plywood.
+
+One ranking is worth knowing about before you try it: **keep track saw cuts above
+saw changes.** Saw changes are a real cost, but the cheapest way to never walk
+between two saws is to use only one — and the one that can make every cut is the
+track saw. Rank saw changes first and you will get a layout that never touches the
+chop saw and does all the easy crosscuts the hard way. The shipped order avoids
+that; the trade-off is pinned by a test rather than left as advice.
+
+## The cutting order
+
+Stop changes are the headline goal, and getting them right is most of what this
+tool does. Four facts about a track saw with parallel stops shape it:
+
+- **The stop is one number** — the width of the strip the saw takes off the
+  reference edge. Two cuts share a setting whenever their offsets match, whatever
+  axis they run along. A 7-3/8" rip and a 7-3/8" crosscut buried in some strip are
+  the *same* setting; turning the work under the saw is free.
+- **Runs carry across sheets.** Finishing one sheet at 7-3/8" and opening the next
+  at 7-3/8" costs nothing — and across *stocks* too, since the stop does not care
+  whether it is cutting half-inch or three-quarter. So which sheet you break down
+  first is a real decision, and so is which column of it you rip first.
+- **The miter saw never touches the stop.** A trip to the chop saw can sit
+  anywhere in the sequence without breaking a run, so chop cuts are placed for saw
+  changes alone — put off to the end of each sheet.
+- **Same-axis runs are permutable.** Every cut in a run of same-axis cuts spans
+  its piece completely, so the sections are parallel bands: the same parts, the
+  same cuts, in whatever order you like — including which band is left as the
+  remainder and so never cut at all.
+
+That last point matters more than it sounds. The order the packer happens to emit
+bands in is arbitrary, so *stop changes are not a property of a layout* until you
+also say what order you cut it in. Measuring the raw tree therefore overstates
+every layout, and by a variable amount — which is exactly the way to mis-rank
+them. `app/schedule.py` scores a layout by the best cutting order it can find
+*for* it, and rewrites the tree to match once a layout is chosen. Sequencing is
+free: it never moves a part, buys a sheet or adds a cut. Applying it is checked
+against that on every solve.
+
+The model of the shop is one sheet at a time: everything that came off a sheet is
+finished before the next is opened. Within that, the order is free — and the whole
+job is sequenced together, so the *Constant widths* panel shows which settings
+carry straight into the next sheet, and the cut list marks the sheets you pick up
+with the stop already where you want it.
+
+### Where the remaining cost is
+
+The report shows both figures against a certified floor, so it is clear which half
+of the problem is still costing you:
+
+- The **stop-change floor** counts, per sheet, the settings that sheet's cuts
+  cannot be made without, and subtracts one per sheet boundary (a run can serve
+  the end of one sheet and the start of the next, but only there). Meeting it
+  proves the *cut order* is optimal for that layout — not that no better layout
+  exists.
+- The **saw-change floor** is the same argument for tool trips: which saw makes a
+  cut is fixed by how far it has to reach, so a sheet holding both kinds needs two
+  blocks of work and one trip between them.
+
+On the sample kitchen the gap to the stop-change floor runs about 10–15%, and most
+of what is left sits in the layout rather than the order: a sheet whose parts
+measure six different widths needs six settings however you sequence it. That is
+what the shared-dimension seeds and moves below are for.
+
+The two goals pull against each other, and the cap is where you decide between
+them. On the sample kitchen the floor is 16 sheets and that layout takes about 114
+stop changes; allow it a 17th and the same job settles around 93, because a looser
+pack can afford to put like widths together. Sheets first is the default because
+plywood costs money, but raising **Max sheets** by one is a real option and the
+report shows you both ends of the trade.
+
+### The identity behind the cut counts
 
 A guillotine layout is a tree, so exactly:
 
@@ -101,12 +220,21 @@ pieces — not scrap area. Every extra offcut costs one more pass. (The trim ter
 for cuts whose remainder is narrower than the blade: the cut happens, but the
 material becomes sawdust, so it adds a cut without adding a piece.)
 
-It also gives a certified floor: `cuts >= parts - sheets`.
+It also gives a certified floor: `cuts >= parts - sheets`. Track cuts and mitre
+cuts partition that total: which saw makes a cut is decided by how far it has to
+reach, not chosen, so the split is a property of the layout and not of the order.
 
 ## Certified bounds and the prover
 
 Every criterion is shown against a provable lower bound. Meeting one is a proof of
 optimality; missing one shows the exact remaining gap and claims nothing more.
+
+Two kinds of bound appear, and they claim different things. Some are properties of
+the *parts* — the area bound on sheets, the crosscuts no layout can move onto the
+chop saw — and hold against every layout there is. The stop-change and saw-change
+floors are properties of *the layout in hand*: meeting one proves the cut order is
+the best available for that layout, and says nothing about whether a better layout
+exists. The report is explicit about which is which rather than blurring them.
 
 **Prove optimality** runs an exhaustive branch-and-bound per sheet. It explores the
 whole space but abandons branches a bound proves cannot win, so a completed search
@@ -115,8 +243,13 @@ eight parts finish and are proven; larger ones time out and are reported as
 unproven rather than dressed up as a proof. Its pruning is checked against literal
 enumeration on instances small enough to enumerate.
 
-Naive brute force is not on the table at real sizes: 138 parts have 2^138 ~ 3.5e41
-orientation combinations alone, which is beyond any hardware.
+**What is not claimed.** For a job the size of a kitchen there is no proof of
+global optimality on offer, and this tool does not pretend otherwise. Guillotine
+cutting is NP-hard, and 200 parts have 2^200 orientation combinations before any
+question of arrangement — beyond any hardware. What the tool does claim is
+narrower and true: the cut *order* is measured, not estimated, and it is shown
+against a floor no order can beat; the plywood cap is never exceeded; and the
+number in the report is the number the cut list will give you.
 
 ## Blade and offcuts
 
@@ -152,10 +285,17 @@ so the labels read `Drawer 1 / Back`. To name them something else entirely
 app/
   step_parser.py   STEP AP242 -> panels, via the XCAF (XDE) layer
   geometry.py      oriented bounding box, thickness clustering, outline projection
-  nesting.py       guillotine packer with kerf + randomised-restart search
-  cuts.py          split tree -> ordered, measurable cut list
+  nesting.py       guillotine packer with kerf, and the layout search
+  staged.py        rip-first layouts: two 1D bin packings instead of one 2D
+  grain.py         a cabinet's faces cut from one continuous run of grain
+  schedule.py      the cutting order: sheet order, band order, stop runs
+  regroup.py       single-sheet door into schedule.py
+  objective.py     the ranked criteria, all measured on the real order
+  bounds.py        certified floors, per criterion
+  cuts.py          split tree + chosen order -> measurable cut list
+  exact.py         branch-and-bound prover, per sheet
   validate.py      invariants asserted after every solve
-  solver.py        orchestration: group by thickness, nest, stream progress, report
+  solver.py        orchestration: group by thickness, nest, sequence, report
   bom.py, units.py, models.py, main.py
 static/            vanilla JS + SVG, no build step
 tools/make_fixture.py   generates a synthetic STEP covering awkward cases
@@ -168,9 +308,9 @@ tests/
 .venv/bin/python -m pytest tests/ -q
 ```
 
-110 tests covering kerf arithmetic, the guillotine invariants, instance-name
-normalisation, the streaming search, all three goals, the separating-cut metric,
-background refinement, and the HTTP API. Hard expectations against
+203 tests covering kerf arithmetic, the guillotine invariants, instance-name
+normalisation, the streaming search, every ranked criterion, the separating-cut
+metric, background refinement, and the HTTP API. Hard expectations against
 the real cabinet: 21 panels, three distinct drawers, no collapsed duplicate names,
 and a unit-scale sanity check (the file declares metres and OpenCascade must
 normalise it to millimetres — a scale slip here would silently produce a layout at
@@ -179,6 +319,24 @@ so a half-finished search can never draw something impossible. Two tests guard
 responsiveness directly: no gap between animation frames may exceed 0.75s, and
 the search must still be finding improvements well after the first half-second on
 a 144-part assembly.
+
+`tests/test_sheets.py` guards the plywood floor, and guards it the only way that
+stays guarded: by checking the floor is reached **from every seed**, not from the
+default one. A search that wins on one random seed is not a working search, and
+the difference is invisible right up until something unrelated consumes the random
+stream differently. That is exactly how a sheet went missing once — see *Finding
+the floor* above. The achieved layout is also re-checked from the API output
+rather than the solver's own invariants, so a tighter pack cannot buy its sheet
+back by overlapping two parts.
+
+`tests/test_schedule.py` is where the cutting order is pinned down, and it is
+built around the one claim everything else rests on — that sequencing is free.
+Every test that reorders also checks the layout survived: the same parts at the
+same sizes, the same cut count per sheet, still valid. A "saving" that quietly
+moved a part or lost a cut is not a saving. It also checks the certified floor
+holds on randomly generated layouts rather than only the ones it was written
+against, that the figure in the report is the one you can count off the cut list,
+and that a grain-matched run is never permuted however much a reorder would save.
 
 Regenerate the synthetic fixture with:
 

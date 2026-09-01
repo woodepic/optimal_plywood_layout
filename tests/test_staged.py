@@ -194,15 +194,45 @@ def test_track_saw_work_reaches_its_provable_floor():
 
 @pytest.mark.skipif(KITCHEN is None, reason="kitchen STEP not present")
 def test_a_bigger_miter_saw_moves_more_work_off_the_track_saw():
+    """...but only when the ranking asks for it.
+
+    Track cuts are ranked first here on purpose. Rank *saw changes* above them
+    and the solver is being told the opposite -- the cheapest way to never walk
+    between two saws is to use only one, and the one that can make every cut is
+    the track saw. It obeys, and a bigger chop saw then buys nothing because the
+    chop saw is not being used at all.
+    """
     panels = parse_step(str(KITCHEN))[0]
 
     def track_cuts(capacity):
         r = solve(panels, LayoutParams(
             effort="fast", max_extra_sheets=10, miter_capacity_mm=capacity,
-            priorities=[STAGED, TRACKCUTS, "sheets"]))
+            priorities=[TRACKCUTS, STAGED, "sheets"]))
         return {c.key: c.value for c in r.report}[TRACKCUTS]
 
     assert track_cuts(600.0) <= track_cuts(MITER)
+
+
+@pytest.mark.skipif(CABINET is None, reason="cabinet STEP not present")
+def test_ranking_saw_changes_first_reaches_for_a_single_saw():
+    """The trap the default ranking is arranged to avoid.
+
+    Saw changes are a real cost, but they are minimised by never picking up the
+    second saw -- which means doing the easy crosscuts on the track saw too. So
+    the shipped ranking puts track cuts above saw changes, and this pins the
+    behaviour rather than leaving it as folklore in the README.
+    """
+    panels = parse_step(str(CABINET))[0]
+    first = solve(panels, LayoutParams(
+        effort="fast", max_extra_sheets=10, miter_capacity_mm=MITER,
+        priorities=[STAGED, TRACKCUTS, "sheets"]))
+    guarded = solve(panels, LayoutParams(
+        effort="fast", max_extra_sheets=10, miter_capacity_mm=MITER,
+        priorities=[TRACKCUTS, STAGED, "sheets"]))
+    saw_first = {c.key: c.value for c in first.report}
+    track_first = {c.key: c.value for c in guarded.report}
+    assert saw_first[STAGED] <= track_first[STAGED]
+    assert track_first[TRACKCUTS] <= saw_first[TRACKCUTS]
 
 
 # ------------------------------------------- strips belong to exactly one saw

@@ -158,14 +158,16 @@ class TestLargeAssembly:
         gaps = [b - a for a, b in zip(stamps, stamps[1:])]
         assert max(gaps) <= 0.75, f"gap of {max(gaps):.2f}s would look frozen"
 
-    def test_solve_stops_early_once_converged(self, panels):
-        """A converged task must hand its unused time back rather than idle."""
+    def test_solve_never_overruns_its_budget(self, panels):
+        """Effort is a ceiling. A hundred and forty parts genuinely have work
+        for all of it -- thorough still beats normal here -- so this asks the
+        question that has an answer: does it stop when told to."""
         from app.solver import EFFORT_BUDGET
         start = time.perf_counter()
         solve(panels, LayoutParams(effort="thorough"))
         elapsed = time.perf_counter() - start
-        assert elapsed < EFFORT_BUDGET["thorough"] * 0.75, \
-            f"used {elapsed:.0f}s of a {EFFORT_BUDGET['thorough']}s budget with nothing to gain"
+        assert elapsed < EFFORT_BUDGET["thorough"] * 1.15, \
+            f"overran a {EFFORT_BUDGET['thorough']}s budget by {elapsed:.0f}s"
 
     def test_large_layout_is_valid_and_efficient(self, panels):
         result = solve(panels, LayoutParams(effort="normal"))
@@ -173,6 +175,27 @@ class TestLargeAssembly:
         placed = {p.panel_id for s in result.sheets for p in s.placements}
         assert len(placed) == 144
         assert result.stats["yield_pct"] > 70
+
+
+@pytest.mark.skipif(CABINET is None, reason="cabinet STEP not present")
+def test_a_converged_job_hands_its_time_back():
+    """Twenty-one parts on two sheets are finished in the first second, so the
+    rest of a two-minute budget must not be sat out.
+
+    Two things used to sit it out, once there was a search stage per ranked
+    criterion and two sweeps over them: the rip-first search ran its full share
+    every time even after its handful of decisions had settled, and the main
+    loop's "it has stopped improving" timer was a flat number of seconds that
+    made sense for two hundred parts and not for twenty. Both now scale, and a
+    small job costs a fraction of the budget instead of all of it.
+    """
+    from app.solver import EFFORT_BUDGET
+    panels = parse_step(str(CABINET))[0]
+    start = time.perf_counter()
+    solve(panels, LayoutParams(effort="thorough"))
+    elapsed = time.perf_counter() - start
+    assert elapsed < EFFORT_BUDGET["thorough"] * 0.75, \
+        f"used {elapsed:.0f}s of a {EFFORT_BUDGET['thorough']}s budget with nothing to gain"
 
 
 # ---------------------------------------------------------------- budgets

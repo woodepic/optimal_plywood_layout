@@ -18,6 +18,7 @@ more pass with the saw.
 """
 from __future__ import annotations
 
+from . import schedule as sched
 from .nesting import SheetLayout, separating_cuts
 
 SHEETS = "sheets"
@@ -50,16 +51,16 @@ LABELS = {
 
 def stage_depth(sheet: SheetLayout,
                 miter_capacity: float = 304.8) -> int:
-    """How many times you swap saws on the worst path through the sheet.
+    """How many saws the worst path through this sheet's cut tree touches.
 
-    Two stages is the pattern worth aiming for: break everything down on the
-    track saw, put it away, then chop the rest. Switching cut *axis* costs
-    nothing with a track saw, so it does not count -- only picking up a
-    different tool does.
+    Two is the shape worth aiming for: break everything down on the track saw,
+    put it away, then chop the rest. Switching cut *axis* costs nothing with a
+    track saw, so it does not count -- only picking up a different tool does.
 
-    One stage is possible but usually undesirable: it means never touching the
-    miter saw, which is the easy work. Rank track cuts above stages to stop the
-    search reaching for it.
+    This is a property of the tree, and a floor on what any order can do with
+    that sheet, so it is a useful thing to assert about a layout. The ranked
+    criterion is not this: `saw_changes` counts the trips you actually make,
+    over the whole job, in the order the cut list gives.
     """
     saws = cut_saws(sheet, miter_capacity)
 
@@ -114,61 +115,15 @@ def cut_offset(sheet: SheetLayout, pid: int) -> float:
 def schedule_cuts(sheet: SheetLayout,
                   miter_capacity: float = 304.8,
                   start_width: float | None = None) -> list[int]:
-    """Order a sheet's cuts so equal track-saw widths land back to back.
+    """One sheet's cuts in an order that keeps the stop still, as piece ids.
 
-    Any order works as long as a piece is cut before its children, which leaves
-    real freedom: several cuts are usually available at once. This spends that
-    freedom on keeping the stop where it is -- take another cut at the current
-    width if one is available, otherwise clear the free miter cuts, and only
-    then move the stop, jumping to whichever width has the most work waiting.
-
-    Ready cuts are bucketed by width so the common case is a dict lookup rather
-    than a scan of everything available. The scan only happens when the stop
-    actually has to move, which is exactly what we are trying to make rare.
+    A thin wrapper over `schedule`, kept because it is the natural unit for a
+    single sheet: the real work -- and the freedom to reorder the bands a run
+    divides a piece into -- lives there.
     """
-    saws = cut_saws(sheet, miter_capacity)
-    widths: dict[int, float] = {}
-    by_width: dict[float, list[int]] = {}
-    free_miter: list[int] = []
-
-    def offer(pid: int) -> None:
-        piece = sheet.pieces[pid]
-        if piece.cut is None:
-            return
-        if saws[pid] == "miter":
-            free_miter.append(pid)
-            return
-        width = round(cut_offset(sheet, pid), 1)
-        widths[pid] = width
-        by_width.setdefault(width, []).append(pid)
-
-    offer(0)
-    order: list[int] = []
-    current = start_width
-
-    while by_width or free_miter:
-        pick = None
-        bucket = by_width.get(current) if current is not None else None
-        if bucket:
-            pick = bucket.pop()
-            if not bucket:
-                del by_width[current]
-        elif free_miter:
-            pick = free_miter.pop()
-        elif by_width:
-            # The stop has to move: go where the most work is waiting.
-            current = max(by_width, key=lambda w: (len(by_width[w]), -w))
-            bucket = by_width[current]
-            pick = bucket.pop()
-            if not bucket:
-                del by_width[current]
-
-        if pick is None:
-            break
-        order.append(pick)
-        for child in sheet.pieces[pick].children:
-            offer(child)
-    return order
+    plan = sched.plan_sheet(sheet, miter_capacity, start_width)
+    sched.apply_plan([sheet], plan, miter_capacity=miter_capacity)
+    return [step.pid for step in plan.steps]
 
 
 def stop_runs(sheets: list[SheetLayout],
@@ -176,37 +131,96 @@ def stop_runs(sheets: list[SheetLayout],
     """Consecutive track cuts sharing a stop, as (width, how many).
 
     Runs carry across sheets: finishing one sheet on a 20" stop and starting the
-    next on 20" costs nothing, because the saw has not been touched. Uses the
-    real schedule, so this is what the cut list will actually say.
+    next on 20" costs nothing, because the saw has not been touched. Axis does
+    not matter either -- the stop is one number, so a rip and a crosscut at the
+    same measurement are the same setting.
     """
-    runs: list[tuple[float, int]] = []
-    current: float | None = None
-    for sheet in sheets:
-        saws = cut_saws(sheet, miter_capacity)
-        for pid in schedule_cuts(sheet, miter_capacity, current):
-            if saws[pid] != "track":
-                continue
-            width = round(cut_offset(sheet, pid), 1)
-            if runs and width == current:
-                runs[-1] = (width, runs[-1][1] + 1)
-            else:
-                runs.append((width, 1))
-            current = width
-    return runs
+    return sched.quick_runs(sheets, miter_capacity)
 
 
 def stop_changes(sheets: list[SheetLayout],
                  miter_capacity: float = 304.8) -> int:
     """How many times the stop has to move on the track saw.
 
-    Counted from the real schedule, not from how many distinct widths appear.
-    Those differ: two columns of equal width sitting either side of a third can
-    only be cut consecutively if nothing has to happen between them, and here
-    something does -- the middle column's rip, at another measurement. Counting
-    distinct widths called that free and undercounted by a fifth, so the search
-    had no reason to put equal widths next to each other.
+    Counted from a real schedule, not from how many distinct widths appear.
+    Those differ, in both directions. Counting distinct widths undercounts,
+    because precedence can force a width to be revisited: two columns of one
+    width either side of a third can only be cut consecutively if nothing has to
+    happen between them. Counting the tree as the packer emitted it *over*counts,
+    because the order of the bands a run divides a piece into is arbitrary --
+    that is the freedom `schedule` spends.
     """
-    return max(0, len(stop_runs(sheets, miter_capacity)) - 1)
+    return sched.score_job(sheets, miter_capacity)[0]
+
+
+def saw_changes(sheets: list[SheetLayout],
+                miter_capacity: float = DEFAULT_MITER_MM) -> int:
+    """How many times you walk between the two saws, over the whole job.
+
+    A property of the cutting order, not of the tree: chop cuts are put off to
+    the end of each sheet, because a chop cut never disturbs the stop and so
+    costs nothing to defer. Two saw changes per sheet is the shape to expect --
+    break it down on the track saw, then chop what came off.
+    """
+    return sched.score_job(sheets, miter_capacity)[1]
+
+
+def biggest_offcut(sheets: list[SheetLayout]) -> float:
+    """Area of the largest single reusable piece anywhere in the job."""
+    biggest = 0.0
+    for sheet in sheets:
+        off = sheet.largest_offcut()
+        if off is not None:
+            biggest = max(biggest, off.area)
+    return biggest
+
+
+def emptiest_first(sheet_area: float):
+    """Sheet count, then how empty the least-full sheet is. Lower is better.
+
+    Sheet count on its own is a hopeless thing to search on: nearly every
+    candidate ties with the incumbent, so the search cannot tell which of them is
+    *closer* to needing one sheet fewer. The tiebreaker is the whole gradient,
+    and which one it is decides whether the floor gets found at all.
+
+    A sheet disappears when its parts fit elsewhere, so the way to lose one is to
+    keep making the least full sheet emptier still: every move that shifts work
+    off it is rewarded, right up to the moment it empties and the count drops.
+
+    With a single sheet there is nothing to shed and nowhere to shed it to, so
+    the term is switched off rather than left arguing for a half-empty sheet.
+    """
+    def rate(sheets: list[SheetLayout]) -> tuple:
+        emptiest = (min(s.used_area() for s in sheets) / sheet_area
+                    if len(sheets) > 1 else 0.0)
+        return (len(sheets), emptiest, -biggest_offcut(sheets))
+    return rate
+
+
+def consolidate_first(sheet_area: float):
+    """Sheet count, then the largest single piece of free material.
+
+    The other gradient: gather the waste into one rectangle instead of scattering
+    it, and eventually everything fits on one sheet fewer. It is much the weaker
+    of the two on big jobs -- a tidy layout is precisely what cannot shed a sheet
+    -- but it wins on small ones, where there are only two sheets and
+    consolidating one of them *is* emptying the other.
+    """
+    def rate(sheets: list[SheetLayout]) -> tuple:
+        return (len(sheets), -biggest_offcut(sheets),
+                sum(s.total_cut_length() for s in sheets))
+    return rate
+
+
+def sheet_surrogates(sheet_area: float) -> tuple:
+    """Both gradients toward one sheet fewer.
+
+    Neither dominates the other, and plywood is the one number nothing else is
+    allowed to trade away, so the opening pass runs both and keeps whichever
+    packed tighter. Two half-length searches beat one full-length search under
+    the wrong gradient by a whole sheet.
+    """
+    return (emptiest_first(sheet_area), consolidate_first(sheet_area))
 
 
 def scrap_pieces(sheet: SheetLayout) -> int:
@@ -235,14 +249,23 @@ def measure(sheets: list[SheetLayout],
         if off is not None:
             biggest = max(biggest, off.area)
 
+    # One schedule answers both sequence questions, and building it is the
+    # expensive part of scoring a layout.
+    stops, saws = sched.score_job(sheets, miter_capacity)
+    miter = track = 0
+    for sheet in sheets:
+        m, t = cut_workload(sheet, miter_capacity)
+        miter += m
+        track += t
+
     return {
         SHEETS: len(sheets),
         GROUPING: (sum(separating_cuts(s, cabinets) for s in sheets)
                    if cabinets else 0),
-        STAGED: max((stage_depth(s, miter_capacity) for s in sheets), default=0),
-        STOPCHANGES: stop_changes(sheets, miter_capacity),
-        TRACKCUTS: sum(cut_workload(s, miter_capacity)[1] for s in sheets),
-        MITERCUTS: sum(cut_workload(s, miter_capacity)[0] for s in sheets),
+        STAGED: saws,
+        STOPCHANGES: stops,
+        TRACKCUTS: track,
+        MITERCUTS: miter,
         OFFCUT: -biggest,
     }
 

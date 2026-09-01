@@ -128,6 +128,9 @@ class StopRun(BaseModel):
     index: int              # 1-based, in cutting order
     width_mm: float
     count: int
+    # Which sheets the run covers, in cutting order. More than one means the
+    # setting carried across a sheet boundary -- the saw was never touched.
+    sheets: list[int] = Field(default_factory=list)
 
 
 class LayoutAlternative(BaseModel):
@@ -145,6 +148,12 @@ class CriterionReport(BaseModel):
     bound: float | None = None
     optimal: bool = False
     rank: int | None = None      # 1-based position in the user's ranking
+    # Did this criterion get its own stage -- solved for in its own right, with
+    # everything above it held fixed? False means the budget ran out first and it
+    # was only ever a tiebreak. See the staged sweep in app/solver.py.
+    solved: bool = False
+    # What it was held at while the ranks below it were solved.
+    held: float | None = None
 
 
 class LayoutResult(BaseModel):

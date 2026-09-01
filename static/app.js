@@ -4,15 +4,33 @@ const MM_PER_IN = 25.4;
 const $ = (id) => document.getElementById(id);
 
 /* One colour per stop measurement, so equal-width track cuts are visibly a set.
-   Hue only -- the line colour still says which saw. */
-const STOP_HUES = [8, 40, 70, 140, 175, 205, 250, 285, 315, 340];
+   Hue only -- the line colour still says which saw.
+
+   A fixed palette wrapped around, which is worse than no colour at all: two
+   widths that are nearly the same -- 7-3/8" and 7-3/4" -- came out identical and
+   read as one run. So the wheel is walked by the golden angle instead, which
+   never repeats within a job, and lightness cycles through three steps so even
+   far-apart hues stay apart. Sorting by width puts near-equal widths at adjacent
+   indices, and the golden angle throws adjacent indices to opposite sides of the
+   wheel -- exactly where the confusion was. */
+const GOLDEN_ANGLE = 137.508;
+let STOP_INDEX = null;         // rounded width (tenths of a mm) -> position
+function stopIndex() {
+  if (STOP_INDEX) return STOP_INDEX;
+  STOP_INDEX = new Map();
+  if (!RESULT || !RESULT.stop_plan) return STOP_INDEX;
+  [...new Set(RESULT.stop_plan.map(r => Math.round(r.width_mm * 10)))]
+    .sort((a, b) => a - b)
+    .forEach((width, i) => STOP_INDEX.set(width, i));
+  return STOP_INDEX;
+}
 function stopColour(offset) {
-  if (!RESULT || !RESULT.stop_plan) return 'hsl(0 0% 60%)';
-  const widths = [...new Set(RESULT.stop_plan.map(r => Math.round(r.width_mm * 10)))]
-    .sort((a, b) => a - b);
-  const i = widths.indexOf(Math.round(offset * 10));
-  if (i < 0) return 'hsl(0 0% 60%)';
-  return `hsl(${STOP_HUES[i % STOP_HUES.length]} 62% 45%)`;
+  const i = stopIndex().get(Math.round(offset * 10));
+  if (i === undefined) return 'hsl(0 0% 60%)';
+  const hue = (i * GOLDEN_ANGLE) % 360;
+  const light = [42, 55, 32][i % 3];
+  const sat = [64, 52, 72][i % 3];
+  return `hsl(${hue.toFixed(1)} ${sat}% ${light}%)`;
 }
 
 const SAW_COLOUR = {
@@ -206,6 +224,7 @@ function adoptUpload(data) {
   PANELS = data.panels;
   OVERRIDES = {};
   RESULT = null;
+  STOP_INDEX = null;
   view.fitted = false;
   $('source').textContent = data.source + ' — ' + PANELS.length + ' parts';
   $('solve').disabled = false;
@@ -269,6 +288,7 @@ async function solve(runOpts) {
       if (!r.ok) throw new Error((await r.json()).detail || 'layout failed');
       if (token !== runToken) return;
       RESULT = await r.json();
+      STOP_INDEX = null;
       hideLoading();
       renderAll();
       return;
@@ -362,6 +382,7 @@ function handleFrame(frame, token) {
   bestSoFar = null;
   VIEWING = 0;
   RESULT = frame.payload;
+  STOP_INDEX = null;
   canvas.classList.toggle('preview', previewing);
   setHidden($('previewNote'), !previewing);
   if (RESULT.sheet_floor) {
@@ -856,8 +877,17 @@ function renderCutList() {
   }
   viewed().sheets.forEach((sheet, i) => {
     const g = groupOf(sheet.group_id, RESULT.groups);
+    // A sheet whose first track cut repeats the last one of the sheet before it
+    // is picked up with the stop already set -- worth saying, because it is the
+    // one saving that is invisible on the drawing.
+    const opens = sheet.cuts.find(c => c.saw === 'track');
+    const prior = i > 0 ? viewed().sheets[i - 1].cuts
+      .filter(c => c.saw === 'track').slice(-1)[0] : null;
+    const carries = opens && prior
+      && Math.abs(opens.offset_mm - prior.offset_mm) < 0.15;
     rows.push(`<tr class="grp"><td colspan="2">Sheet ${i + 1}${g && g.nominal ? ' — ' + g.nominal : ''}
-      (${sheet.cuts.length} cuts)</td></tr>`);
+      (${sheet.cuts.length} cuts)${carries
+        ? ` <span class="septag">stop already at ${escapeHtml(fmt(opens.offset_mm))}</span>` : ''}</td></tr>`);
     sheet.cuts.forEach(c => rows.push(
       `<tr><td class="num"><span class="cutno${c.separates ? ' sep' : ''}"
              >${c.index}</span></td>
@@ -876,12 +906,24 @@ function renderStopPlan() {
   const host = $('stopplan');
   if (!runs.length) { host.innerHTML = '<p class="muted small">No track cuts.</p>'; return; }
 
+  const carried = runs.filter(r => (r.sheets || []).length > 1).length;
+  const lead = carried
+    ? `<tr><td colspan="4" class="seplead">${carried} of these
+        ${carried === 1 ? 'setting carries' : 'settings carry'} straight into the
+        next sheet — the saw is not touched at the changeover.</td></tr>`
+    : '';
   host.innerHTML = '<table><thead><tr><th>#</th><th class="num">Stop</th>'
-    + '<th class="num">Cuts</th></tr></thead><tbody>'
-    + runs.map(r => `<tr class="stoprow" data-w="${r.width_mm}">
+    + '<th class="num">Cuts</th><th class="num">Sheet</th></tr></thead><tbody>'
+    + lead
+    + runs.map(r => {
+        const on = r.sheets || [];
+        const span = on.length > 1 ? `${on[0]}–${on[on.length - 1]}` : (on[0] || '');
+        return `<tr class="stoprow" data-w="${r.width_mm}">
         <td class="num"><span class="swatch" style="background:${stopColour(r.width_mm)}"></span>${r.index}</td>
         <td class="num"><b>${escapeHtml(fmt(r.width_mm))}</b></td>
-        <td class="num">${r.count}</td></tr>`).join('')
+        <td class="num">${r.count}</td>
+        <td class="num${on.length > 1 ? ' carried' : ''}">${span}</td></tr>`;
+      }).join('')
     + '</tbody></table>';
 
   host.querySelectorAll('.stoprow').forEach(row => {

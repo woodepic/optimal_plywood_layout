@@ -12,6 +12,7 @@ from collections import deque
 from .models import Cut
 from .nesting import SheetLayout, separating_pieces
 from .objective import cut_offset, cut_saws, schedule_cuts
+from .schedule import q as sched_q
 from .units import format_length
 
 
@@ -78,7 +79,10 @@ def order_cuts(sheet: SheetLayout, sheet_index: int, part_labels: dict[str, str]
                cabinets: dict[str, str] | None = None,
                miter_capacity: float = 304.8,
                prefer: str = "stops",
-               start_width: float | None = None) -> list[Cut]:
+               start_width: float | None = None,
+               sequence: list[int] | None = None,
+               settings: dict[int, float] | None = None,
+               group_start: int = 0) -> list[Cut]:
     """Emit one sheet's cuts in a valid, workable order.
 
     Two orderings are useful and they pull against each other, so the caller
@@ -89,15 +93,24 @@ def order_cuts(sheet: SheetLayout, sheet_index: int, part_labels: dict[str, str]
     "cabinets" make the cuts that isolate a cabinet first, so parts can be
                sorted into piles early.
 
-    Either way a piece is always cut before its children, so the sequence is
+    `sequence` is the order the whole-job scheduler chose for this sheet, and is
+    what the caller normally passes: the order only makes sense alongside the
+    sheet order and the setting the saw arrives at, both of which are decided
+    across the job rather than here. Without one, this sheet is scheduled on its
+    own. Either way a piece is always cut before its children, so the sequence is
     physically valid.
+
+    `settings` carries the scheduler's own measurement for each cut. Recomputing
+    it here from the geometry agrees to about 1e-13, which is invisible right up
+    until a value sits on a rounding boundary and the instructions disagree with
+    the stop plan about whether two cuts share a setting.
     """
     isolating = separating_pieces(sheet, cabinets) if cabinets else set()
     saws = cut_saws(sheet, miter_capacity)
 
     if prefer == "cabinets" and cabinets:
         sequence = _cabinet_first_order(sheet, cabinets)
-    else:
+    elif sequence is None:
         sequence = schedule_cuts(sheet, miter_capacity, start_width)
 
     counter = 0
@@ -105,7 +118,7 @@ def order_cuts(sheet: SheetLayout, sheet_index: int, part_labels: dict[str, str]
     counter += 1
 
     cuts: list[Cut] = []
-    group = 0
+    group = group_start
     width_now = start_width
 
     for pid in sequence:
@@ -137,14 +150,18 @@ def order_cuts(sheet: SheetLayout, sheet_index: int, part_labels: dict[str, str]
             from_edge = "bottom"
             verb = "Crosscut"
 
+        setting = (settings or {}).get(pid)
+        if setting is None:
+            setting = sched_q(offset)
+        offset = setting
+
         # Track cuts at one stop setting form a run; a miter cut does not
         # disturb the stop, so it stays in whatever run surrounds it.
         saw = saws.get(pid, "track")
         if saw == "track":
-            rounded = round(offset, 1)
-            if width_now is None or rounded != width_now:
+            if width_now is None or setting != width_now:
                 group += 1
-                width_now = rounded
+                width_now = setting
 
         produced_list = [sheet.pieces[c].label for c in piece.children]
         produced = " + ".join(produced_list)

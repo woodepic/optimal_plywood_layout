@@ -118,6 +118,10 @@ def expand(layout: SheetLayout, runs: list[FaceRun]) -> None:
     Rebuilds the placement list in one pass -- splicing in place would shift the
     positions of composites not yet reached. Idempotent: once expanded there are
     no composites left to match.
+
+    The resulting run of crosscuts is pinned: reordering the bands of a run is
+    free for the saw, but not here -- the order is what makes the grain continue
+    across the installed faces.
     """
     by_id = {run.id: run for run in runs}
     rebuilt: list[tuple[str, int, bool]] = []
@@ -132,6 +136,9 @@ def expand(layout: SheetLayout, runs: list[FaceRun]) -> None:
         layout.pieces[piece_id].part_id = None
         cursor = piece_id
         for panel in run.members:
+            # The order these come off in *is* the requirement, so the
+            # sequencer must not permute them like an ordinary run of bands.
+            layout.pieces[cursor].pinned = True
             kept, rest = layout._cut(cursor, "H", panel.width_mm)
             layout.pieces[kept].part_id = panel.id
             # Rotated: the face's long side runs across the sheet, so the grain

@@ -9,12 +9,19 @@ from __future__ import annotations
 
 import random
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from math import ceil
 from typing import NamedTuple
 
 EPS = 1e-6
-HEURISTICS = ("BAF", "BSSF", "BLSF")
+# How to choose which free rectangle a part goes in. The first three are the
+# classic area/short-side/long-side fits. "STOP" is ours: among the rectangles a
+# part fits in, prefer the one whose cuts land on a measurement this sheet has
+# already been set to -- or need no cut at all. Every cut offset is a part
+# dimension, so that is the difference between a sheet needing two stop settings
+# and needing six.
+HEURISTICS = ("BAF", "BSSF", "BLSF", "STOP")
+STOP_ROUND = 1        # mm; offsets this close are one setting, as in app.schedule
 
 # Objective modes.
 MODE_MATERIAL = "material"
@@ -47,6 +54,10 @@ class Piece:
     cut: CutRecord | None = None
     part_id: str | None = None
     label: str = ""
+    # Set when this cut's position in its run is not free to change -- the
+    # continuous-grain faces have to come off in installation order. See
+    # app.grain and Chain.pinned in app.schedule.
+    pinned: bool = False
 
     @property
     def area(self) -> float:
@@ -77,6 +88,33 @@ class SheetLayout:
         self.next_id = 1
         self.free: list[int] = [0]
         self.placed: list[tuple[str, int, bool]] = []   # (part_id, piece_id, rotated)
+        # Set by app.schedule, which decomposes the cut tree into permutable
+        # runs and schedules them. Both are pure functions of the tree, and the
+        # search reschedules the same sheets thousands of times, so they are
+        # remembered here and dropped the moment the tree changes.
+        self.chain_cache = None
+        self.sched_cache = None
+        # Every stop setting this sheet's cuts have used, and how often. Drives
+        # the "STOP" placement heuristic.
+        self.stops: dict[float, int] = {}
+
+    def copy(self) -> "SheetLayout":
+        """A detached copy, so a caller can rewrite the tree without side effects.
+
+        Sequencing rewrites the order the bands of a run are cut in. That is
+        free and desirable, but the search holds these layouts and compares them
+        against scores taken earlier, so composing an answer works on a copy.
+        """
+        clone = SheetLayout(self.width, self.length, self.kerf, self.min_offcut)
+        clone.pieces = {pid: replace(pc, children=list(pc.children),
+                                     cut=(None if pc.cut is None
+                                          else replace(pc.cut)))
+                        for pid, pc in self.pieces.items()}
+        clone.next_id = self.next_id
+        clone.free = list(self.free)
+        clone.placed = list(self.placed)
+        clone.stops = dict(self.stops)
+        return clone
 
     # -- cutting ---------------------------------------------------------
 
@@ -94,6 +132,9 @@ class SheetLayout:
         remainder = (pc.w - size) if axis == "V" else (pc.h - size)
         if remainder <= EPS:
             return pid, None
+        self.chain_cache = self.sched_cache = None
+        setting = round(size, STOP_ROUND)
+        self.stops[setting] = self.stops.get(setting, 0) + 1
 
         if axis == "V":
             kept = Piece(self.next_id, pc.x, pc.y, size, pc.h, parent=pid)
@@ -121,12 +162,22 @@ class SheetLayout:
 
     # -- placement -------------------------------------------------------
 
-    def _fit_score(self, pc: Piece, w: float, h: float, heuristic: str) -> float:
+    def _fit_score(self, pc: Piece, w: float, h: float, heuristic: str):
         if heuristic == "BAF":
             return pc.area - w * h
         if heuristic == "BSSF":
             return min(pc.w - w, pc.h - h)
-        return max(pc.w - w, pc.h - h)
+        if heuristic == "BLSF":
+            return max(pc.w - w, pc.h - h)
+        # STOP: reuse a setting the saw is already at, and prize a dimension
+        # that needs no cut at all, before worrying about wasted area.
+        credit = 0
+        for extent, size in ((pc.w, w), (pc.h, h)):
+            if extent - size <= EPS:
+                credit += 2                     # exact fit: no cut, no setting
+            elif round(size, STOP_ROUND) in self.stops:
+                credit += 1
+        return (-credit, pc.area - w * h)
 
     def try_place(self, part: PartSpec, heuristic: str, vertical_first: bool) -> bool:
         options = [(part.w, part.h, False)]
@@ -275,6 +326,46 @@ def _grouped_orders(parts: list[PartSpec]) -> list[list[PartSpec]]:
     return orders
 
 
+def _families(parts: list[PartSpec]) -> dict[float, list[PartSpec]]:
+    """Group parts by the dimension they share with the most other parts.
+
+    Every cut offset is some part's dimension, so a sheet holding six different
+    dimensions needs six stop settings. Parts that share one belong together:
+    put them on the same sheet and those six settings become two.
+    """
+    popularity: dict[float, int] = {}
+    for part in parts:
+        for dim in {round(part.w, 1), round(part.h, 1)}:
+            popularity[dim] = popularity.get(dim, 0) + 1
+    families: dict[float, list[PartSpec]] = {}
+    for part in parts:
+        dims = {round(part.w, 1), round(part.h, 1)}
+        home = max(dims, key=lambda d: (popularity[d], d))
+        families.setdefault(home, []).append(part)
+    return families
+
+
+def _family_orders(parts: list[PartSpec]) -> list[list[PartSpec]]:
+    """Orderings that keep each shared-dimension family together.
+
+    First-fit then finishes one family before starting the next, so a sheet
+    fills up with parts that measure the same rather than a jumble -- which is
+    the difference between one long run at the saw and several short ones.
+    """
+    families = _families(parts)
+    if len(families) < 2:
+        return []
+    orders = []
+    for rank in (lambda item: -len(item[1]),         # biggest family first
+                 lambda item: -item[0]):             # widest dimension first
+        blocks = sorted(families.items(), key=rank)
+        for inner in (lambda ps: sorted(ps, key=lambda p: -(p.w * p.h)),
+                      lambda ps: sorted(ps, key=lambda p: (-max(p.w, p.h),
+                                                           -min(p.w, p.h)))):
+            orders.append([p for _, block in blocks for p in inner(block)])
+    return orders
+
+
 def _seed_orders(parts: list[PartSpec]) -> list[list[PartSpec]]:
     return [
         sorted(parts, key=lambda p: -(p.w * p.h)),
@@ -364,6 +455,43 @@ def _buckets_from(sheets: list[SheetLayout],
     return [[by_id[pid] for pid, _, _ in sheet.placed] for sheet in sheets]
 
 
+def dissolve(buckets: list[list[PartSpec]], victim: int, width: float,
+             length: float, kerf: float, heuristic: str, vertical_first: bool,
+             min_offcut: float = 0.0) -> list[list[PartSpec]] | None:
+    """Empty one sheet onto the others. None if its parts will not all fit.
+
+    This is the move nothing else can make. Reordering cannot carry a part to a
+    different sheet, and the assignment moves shuffle parts between existing
+    sheets without ever removing one, so a layout that has settled on N sheets
+    stays on N. Dissolving is how it gets to N - 1.
+
+    It packs for real rather than guessing: each orphan is offered to every
+    surviving sheet's live free rectangles in turn. So a bucket list that comes
+    back is one that is already known to fit -- and because each orphan is
+    appended in the order it was placed, repacking those buckets reproduces
+    exactly the layout that was just proved feasible.
+    """
+    if len(buckets) < 2 or not 0 <= victim < len(buckets):
+        return None
+    survivors = [b[:] for i, b in enumerate(buckets) if i != victim]
+    layouts = []
+    for bucket in survivors:
+        layout = pack_one(bucket, width, length, kerf, heuristic,
+                          vertical_first, min_offcut)
+        if layout is None:
+            return None
+        layouts.append(layout)
+
+    for part in sorted(buckets[victim], key=lambda p: -(p.w * p.h)):
+        for index, layout in enumerate(layouts):
+            if layout.try_place(part, heuristic, vertical_first):
+                survivors[index].append(part)
+                break
+        else:
+            return None                 # this sheet cannot be dissolved
+    return survivors
+
+
 def _neighbour(buckets: list[list[PartSpec]], rng: random.Random,
                allow_new_sheet: bool) -> list[list[PartSpec]] | None:
     """One move in assignment space.
@@ -420,20 +548,67 @@ def _neighbour(buckets: list[list[PartSpec]], rng: random.Random,
             return None
         out[i] = _perturb(out[i], rng)
 
-    else:                                             # empty the emptiest sheet
+    else:                                  # gather one dimension onto one sheet
         if n < 2:
             return None
-        i = min(range(n), key=lambda k: len(out[k]))
-        loose = out.pop(i)
-        for part in loose:
-            out[rng.randrange(len(out))].append(part)
+        out = _gather(out, rng) or out
 
     return [b for b in out if b]
 
 
+def _gather(buckets: list[list[PartSpec]],
+            rng: random.Random) -> list[list[PartSpec]] | None:
+    """Pull the parts that share one dimension onto the sheet holding most of them.
+
+    Feasibility is left to the repack, as with the other assignment moves: what
+    matters is that the move exists at all, because nothing else pushes a layout
+    towards sheets whose parts all measure the same.
+    """
+    where: dict[float, set[int]] = {}
+    for index, bucket in enumerate(buckets):
+        for part in bucket:
+            for dim in {round(part.w, 1), round(part.h, 1)}:
+                where.setdefault(dim, set()).add(index)
+    spread = [dim for dim, sheets in where.items() if len(sheets) > 1]
+    if not spread:
+        return None
+
+    target = rng.choice(spread)
+    matches = lambda p: target in (round(p.w, 1), round(p.h, 1))
+    homes = where[target]
+    home = max(homes, key=lambda i: sum(1 for p in buckets[i] if matches(p)))
+
+    out = [b[:] for b in buckets]
+    moved: list[PartSpec] = []
+    for index in homes:
+        if index == home:
+            continue
+        staying = [p for p in out[index] if not matches(p)]
+        going = [p for p in out[index] if matches(p)]
+        if going and staying:
+            out[index] = staying
+            moved.extend(going)
+    if not moved:
+        return None
+    # Trade the same number of parts back, so the home sheet is not simply
+    # asked to hold everything.
+    rng.shuffle(moved)
+    keep = moved[:max(1, len(moved) // 2)]
+    for part in moved[len(keep):]:
+        out[rng.randrange(len(out))].append(part)
+    out[home].extend(keep)
+    return out
+
+
 def optimise_assign(buckets, width, length, kerf, heuristic, vertical_first,
                     min_offcut: float = 0.0):
-    """Realise an assignment, or None if any sheet's parts do not fit."""
+    """Realise an assignment, or None if any sheet's parts do not fit.
+
+    The search itself goes through `optimise_iter`'s own depot, which keeps one
+    packed sheet per distinct set of parts -- an assignment move changes one or
+    two sheets, so repacking all of them was most of the cost of trying a move.
+    This is the plain version, for a caller that just wants the layouts.
+    """
     sheets = []
     for bucket in buckets:
         layout = pack_one(bucket, width, length, kerf, heuristic, vertical_first,
@@ -442,6 +617,39 @@ def optimise_assign(buckets, width, length, kerf, heuristic, vertical_first,
             return None
         sheets.append(layout)
     return sheets
+
+
+def _perturb_family(order: list[PartSpec], rng: random.Random,
+                    family_of: dict[str, float]) -> list[PartSpec]:
+    """Perturb without breaking up the shared-dimension families.
+
+    Element-level swaps scatter parts that measure the same across sheets, which
+    is exactly what costs stop settings. So move whole families around, or
+    reorder inside one, leaving each family contiguous. Same idea as keeping a
+    cabinet together, applied to the thing the saw cares about.
+    """
+    blocks: list[list[PartSpec]] = []
+    for part in order:
+        key = family_of.get(part.id)
+        if blocks and family_of.get(blocks[-1][0].id) == key:
+            blocks[-1].append(part)
+        else:
+            blocks.append([part])
+
+    roll = rng.random()
+    if roll < 0.35 and len(blocks) > 1:                  # swap two families
+        i, j = rng.randrange(len(blocks)), rng.randrange(len(blocks))
+        blocks[i], blocks[j] = blocks[j], blocks[i]
+    elif roll < 0.65 and len(blocks) > 1:                # move one family
+        blocks.insert(rng.randrange(len(blocks)),
+                      blocks.pop(rng.randrange(len(blocks))))
+    else:                                                # reorder inside one
+        inner = blocks[rng.randrange(len(blocks))]
+        if len(inner) > 1:
+            i, j = rng.randrange(len(inner)), rng.randrange(len(inner))
+            inner[i], inner[j] = inner[j], inner[i]
+
+    return [part for block in blocks for part in block]
 
 
 def _perturb_align(order: list[PartSpec], rng: random.Random) -> list[PartSpec]:
@@ -502,6 +710,8 @@ def optimise_iter(parts: list[PartSpec], width: float, length: float, kerf: floa
     rng = random.Random(seed)
     rate = scorer if scorer is not None else (lambda sh: score(sh, mode, cabinets))
     by_id = {p.id: p for p in parts}
+    family_of = {part.id: dim
+                 for dim, block in _families(parts).items() for part in block}
     best: list[SheetLayout] | None = None
     best_score: tuple | None = None
     best_order: list[PartSpec] | None = None
@@ -525,7 +735,7 @@ def optimise_iter(parts: list[PartSpec], width: float, length: float, kerf: floa
     # Cabinet-grouped seeds are cheap, so include them whenever cabinets are
     # known; whether to *perturb* group-wise follows how the user ranked things.
     grouped = group_aware if group_aware is not None else (mode == MODE_CABINETS)
-    seeds = _seed_orders(parts)
+    seeds = _family_orders(parts) + _seed_orders(parts)
     if cabinets or mode == MODE_CABINETS:
         seeds = _grouped_orders(parts) + seeds
     if warm_start:
@@ -552,6 +762,29 @@ def optimise_iter(parts: list[PartSpec], width: float, length: float, kerf: floa
             return True
         return False
 
+    # One packed sheet per distinct set of parts. Assignment moves change one or
+    # two sheets and leave the rest alone, so repacking every sheet each time was
+    # most of the cost of trying a move -- and the scheduler's own per-sheet
+    # working is cached on the layout object, so a reused sheet is free to score
+    # as well. Nothing mutates a layout once packed, so sharing is safe.
+    depot: dict[tuple, SheetLayout] = {}
+
+    def realise(assignment, heuristic, vertical_first):
+        sheets = []
+        for bucket in assignment:
+            key = (heuristic, vertical_first, tuple(p.id for p in bucket))
+            layout = depot.get(key)
+            if layout is None:
+                layout = pack_one(bucket, width, length, kerf, heuristic,
+                                  vertical_first, min_offcut)
+                if layout is None:
+                    return None
+                if len(depot) > 8000:
+                    depot.clear()
+                depot[key] = layout
+            sheets.append(layout)
+        return sheets
+
     deadline = time.perf_counter() + time_budget
     last_beat = time.perf_counter()
     current = best_order[:]
@@ -572,13 +805,29 @@ def optimise_iter(parts: list[PartSpec], width: float, length: float, kerf: floa
         # sheet count) and moving individual parts between sheets (which is the
         # only way to bring a stray part back beside the rest of its cabinet).
         assign_share = 0.55 if len(best) <= sheet_floor else 0.3
-        if rng.random() < assign_share:
+        # Try to shed a sheet outright now and then, and often while the layout
+        # is still above the area floor. Nothing else can remove a sheet: the
+        # other moves shuffle parts between the sheets that already exist.
+        dissolve_share = 0.35 if len(best) > sheet_floor else 0.08
+        if len(best) > 1 and rng.random() < dissolve_share:
+            victim = (min(range(len(buckets)), key=lambda k: len(buckets[k]))
+                      if rng.random() < 0.5 else rng.randrange(len(buckets)))
+            candidate = dissolve(buckets, victim, width, length, kerf,
+                                 heuristic, vertical_first, min_offcut)
+            if candidate is None:
+                stale += 1
+                continue
+            sheets = realise(candidate, heuristic, vertical_first)
+            improved = consider_sheets(sheets, [p for b in candidate for p in b],
+                                       (heuristic, vertical_first))
+            if improved:
+                buckets = candidate
+        elif rng.random() < assign_share:
             candidate = _neighbour(buckets, rng, allow_new_sheet=True)
             if candidate is None:
                 stale += 1
                 continue
-            sheets = optimise_assign(candidate, width, length, kerf,
-                                     heuristic, vertical_first, min_offcut)
+            sheets = realise(candidate, heuristic, vertical_first)
             improved = consider_sheets(sheets, [p for b in candidate for p in b],
                                        (heuristic, vertical_first))
             if improved:
@@ -586,9 +835,13 @@ def optimise_iter(parts: list[PartSpec], width: float, length: float, kerf: floa
         else:
             if grouped:
                 candidate = _perturb_grouped(current, rng)
-            elif align_offsets and rng.random() < 0.45:
-                # Bias towards orderings that reuse cut measurements.
-                candidate = _perturb_align(current, rng)
+            elif align_offsets and rng.random() < 0.7:
+                # Bias towards orderings that reuse cut measurements: mostly by
+                # shuffling whole shared-dimension families, occasionally by
+                # gathering one family that has drifted apart.
+                candidate = (_perturb_family(current, rng, family_of)
+                             if rng.random() < 0.7
+                             else _perturb_align(current, rng))
             else:
                 candidate = _perturb(current, rng)
             improved = consider(candidate, heuristic, vertical_first)

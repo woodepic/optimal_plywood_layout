@@ -169,6 +169,10 @@ tr.total td{font-weight:700;border-top:2px solid var(--line);background:#f7f4ee}
         letter-spacing:.04em;white-space:nowrap}
 td.seplead{background:#f3f5fb;color:#2f3e7e;font-size:12px;line-height:1.5}
 
+/* A stop setting that carried from one sheet into the next: the saw was never
+   touched at the changeover, which is a real saving and easy to miss. */
+td.carried{color:#1f8a4c;font-weight:700}
+
 /* ---- ranked priorities ---- */
 .prio{list-style:none;margin:0;padding:0;counter-reset:p}
 .prio li{display:flex;align-items:center;gap:6px;padding:4px 0;font-size:12.5px}
