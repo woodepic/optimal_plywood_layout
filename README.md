@@ -179,6 +179,40 @@ track saw. Rank saw changes first and you will get a layout that never touches t
 chop saw and does all the easy crosscuts the hard way. The shipped order avoids
 that; the trade-off is pinned by a test rather than left as advice.
 
+### What the floor pass decides, it decides for good
+
+Worth knowing before tuning anything here. Once a stock is packed onto its floor
+the sheets are about 92% full, and at that density the layout is effectively
+frozen: measured over **20,000 legal moves at the floor -- reordering within a
+sheet, swapping parts between sheets, every kind the search has -- not one
+changed the track-cut count.** There is simply nowhere for a part to go.
+
+So the ranked stages cannot fix a badly-shaped layout, however much budget they
+are given. Whatever shape the floor pass settles on is the shape of the answer,
+which is why the two gradients are chained rather than raced: shape the layout
+with consolidation, then squeeze the last sheet out of *that*. Run independently
+and compared, the shaped layout loses on sheet count and its structure is thrown
+away — worth about 25 track cuts on the sample kitchen.
+
+**This is the part that is not yet solved.** Whether a well-shaped layout can be
+squeezed onto the floor is close to a coin toss: on the sample kitchen's big
+stock, the consolidation gradient reliably produces ~140 track cuts but reaches
+the floor on only about 2 attempts in 15. When it does, the whole job comes out
+at 16 sheets and ~170 track cuts; when it does not, the fallback gradient gets
+the sheet but lands nearer 158, and the job comes out around 182. Both answers
+are valid and use the same 16 sheets — one is just meaningfully nicer to cut.
+
+Making it certain means running many shape-then-squeeze rounds and keeping the
+best, which needs more budget than the floor pass currently gets. Simply giving
+it half the budget and three rounds was tried and came out *worse*, because it
+starves the ranked stages that do the stop-change work. The fix is a better
+squeeze, not more rounds.
+
+Below a few seconds per stock the shaping is dropped rather than gambled with,
+and the floor pass runs only the gradient that always reaches the floor. The
+shape is a preference; the sheet count is not, and a third of a two-second
+budget spent on a gradient that stops a sheet short is a straight loss.
+
 ## The cutting order
 
 Stop changes are the headline goal, and getting them right is most of what this

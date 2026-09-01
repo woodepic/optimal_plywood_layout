@@ -778,6 +778,7 @@ def optimise_iter(parts: list[PartSpec], width: float, length: float, kerf: floa
                   scorer=None, group_aware: bool | None = None,
                   min_offcut: float = 0.0, align_offsets: bool = False,
                   heuristics: tuple[str, ...] | None = None,
+                  ordering_only: bool = False,
                   miter_capacity: float = DEFAULT_MITER,
                   allow_best_fit: bool = False):
     """Search for the best guillotine layout, reporting progress as it goes.
@@ -903,11 +904,21 @@ def optimise_iter(parts: list[PartSpec], width: float, length: float, kerf: floa
         # Alternate between reshuffling the global ordering (which can collapse
         # sheet count) and moving individual parts between sheets (which is the
         # only way to bring a stray part back beside the rest of its cabinet).
-        assign_share = 0.55 if len(best) <= sheet_floor else 0.3
+        # Reordering the whole list and repacking is a different kind of move
+        # from shuffling parts between the sheets that already exist, and they
+        # are not interchangeable. The ordering moves are what shape a layout --
+        # they decide the columns, and so the cut structure. Offered the other
+        # kinds as well, a search told to find a well-shaped layout spends most
+        # of its budget nudging individual parts and stops a sheet short of the
+        # one the ordering moves would have found. `ordering_only` is for the
+        # pass whose whole job is the shape.
+        assign_share = (0.0 if ordering_only
+                        else 0.55 if len(best) <= sheet_floor else 0.3)
         # Try to shed a sheet outright now and then, and often while the layout
         # is still above the area floor. Nothing else can remove a sheet: the
         # other moves shuffle parts between the sheets that already exist.
-        dissolve_share = 0.35 if len(best) > sheet_floor else 0.08
+        dissolve_share = (0.0 if ordering_only
+                          else 0.35 if len(best) > sheet_floor else 0.08)
         if len(best) > 1 and rng.random() < dissolve_share:
             victim = (min(range(len(buckets)), key=lambda k: len(buckets[k]))
                       if rng.random() < 0.5 else rng.randrange(len(buckets)))

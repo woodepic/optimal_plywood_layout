@@ -290,6 +290,7 @@ def solve_streaming(panels: list[Panel], params: LayoutParams,
     ALTERNATE_POOL = 3
 
     caps: dict[str, int | None] = {}
+    last_run: dict = {}
 
     def cap_for(task: Task) -> int | None:
         """How many sheets this task may use right now.
@@ -446,7 +447,8 @@ def solve_streaming(panels: list[Panel], params: LayoutParams,
         return measure(layouts, cabinet_arg, params.miter_capacity_mm)
 
     def run_task(task: Task, budget: float, seed: int, pass_no: int, warm=None,
-                 rate=None, stage: str | None = None, patient: bool = False):
+                 rate=None, stage: str | None = None, patient: bool = False,
+                 ordering_only: bool = False):
         """Search one task, streaming frames. Keeps the result only if better.
 
         `patient` spends the whole budget instead of handing it back when the
@@ -576,6 +578,7 @@ def solve_streaming(panels: list[Panel], params: LayoutParams,
                                    # here cost both the sheet and the structure.
                                    heuristics=(DENSITY_HEURISTICS if patient
                                                else None),
+                                   ordering_only=ordering_only,
                                    allow_best_fit=ceiling_now > task.area_bound):
             if state.improved:
                 best_layouts, best_score, best_order = state.sheets, state.score, state.order
@@ -654,6 +657,11 @@ def solve_streaming(panels: list[Panel], params: LayoutParams,
         if best_layouts is not None and not over(best_layouts):
             remember(task.id, best_layouts, best_score)
 
+        # What this run ended on, stored or not: a follow-up pass may want to
+        # start from a layout that lost on the score but had the shape right.
+        last_run["layouts"] = best_layouts
+        last_run["order"] = list(best_order or ())
+
         if best_layouts is not None and not over(best_layouts):
             known = sheet_floors.get(task.id)
             if known is None or len(best_layouts) < known:
@@ -687,22 +695,59 @@ def solve_streaming(panels: list[Panel], params: LayoutParams,
     # stages.
     floor_budget = (min(total_budget * 0.22, 6.0) if params.floor_only
                     else min(max(total_budget * 0.35, 3.0), 30.0))
+    # Shape, then squeeze, then a safety net -- and the order is the point.
+    #
+    # The two gradients are good at different halves of the job. Consolidation
+    # -- gather the waste into one rectangle -- reliably produces a layout that
+    # is *pleasant to cut*: clean columns, the slack in one place, about 140
+    # track cuts on the sample kitchen's big stock. It just as reliably stops one
+    # sheet short of the floor. The emptiest-sheet gradient reliably gets that
+    # last sheet out, and lands on ~158 track cuts, because nothing in it cares
+    # what shape the layout is.
+    #
+    # Run independently and compared, the good half is thrown away: sheet count
+    # leads both, so the 12-sheet layout wins and its structure is whatever the
+    # fill gradient happened to leave. So the squeeze starts *from* the shaped
+    # layout instead of cold. The third run is the safety net, and only fires if
+    # the squeeze did not reach the floor: plywood is priority one and structure
+    # must never cost a sheet.
+    #
+    # Why it has to happen here: at the floor the sheets are 92% full, and
+    # measured over 20,000 legal moves at the floor, not one changed the
+    # track-cut count. The shape this pass settles on is the shape of the answer.
+    #
+    # It is not reliable, and the honest reason is in the README: whether a
+    # shaped layout can be squeezed onto the floor is close to a coin toss, and
+    # the way to make it certain is more rounds than this budget affords.
+    shape, squeeze = SURROGATES[1], SURROGATES[0]
+    ROUTINE = ((shape, 0.34, False, True), (squeeze, 0.33, True, False),
+               (squeeze, 1.00, False, False))
+    # Below this there is not enough time to shape a layout *and* still be sure
+    # of the sheet, so the shaping is dropped rather than gambled with. Spending
+    # a third of a two-second budget on a gradient that stops a sheet short cost
+    # a sheet of plywood at Fast effort, which is a straight loss: the shape is
+    # a preference and the sheet count is not.
+    SHAPE_MINIMUM = 6.0
     for task in tasks:
         share = floor_budget * weights[task.id] / max(sum(weights.values()), 1)
         began = time.perf_counter()
-        for n, rate in enumerate(SURROGATES):
-            if task.id in results and len(results[task.id][0]) <= task.area_bound:
-                break     # at the area bound: no layout can beat this, so stop
+        routine = (ROUTINE if share >= SHAPE_MINIMUM
+                   else ((squeeze, 1.00, False, False),))
+        for n, (rate, portion, from_shape, only_order) in enumerate(routine):
             left = share - (time.perf_counter() - began)
             if left <= 0:
                 break
-            # The first gradient gets the larger slice because it is the one
-            # that usually gets there; the second only runs if it did not.
-            slice_now = left * 0.65 if n < len(SURROGATES) - 1 else left
-            yield from run_task(task, slice_now, FIRST_PASS_SEED + n * 13, 1,
-                                rate=rate, patient=True)
+            at_bound = (task.id in results
+                        and len(results[task.id][0]) <= task.area_bound)
+            if n == len(routine) - 1 and at_bound and n > 0:
+                break     # the count is settled; the safety net is not needed
+            warm = (last_run.get("order") or None) if from_shape else None
+            yield from run_task(task, min(left, share * portion),
+                                FIRST_PASS_SEED + n * 13, 1, warm=warm,
+                                rate=rate, patient=True,
+                                ordering_only=only_order)
         # `run_task` only stores a layout that beats what it already had, and
-        # sheet count leads both surrogates, so this is the better of the two.
+        # sheet count leads every gradient here, so this is the best of the run.
         sheet_floors[task.id] = (len(results[task.id][0]) if task.id in results
                                  else task.area_bound)
 
